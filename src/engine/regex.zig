@@ -1332,9 +1332,11 @@ pub const Regex = struct {
         var parser = Parser.init(arena, pattern);
         const ast = try parser.parse();
 
-        // Extract required literals for optimization
-        // Extract required literal prefix for prefiltering
-        const req_lit = extractRequiredLiterals(ast, allocator);
+        // Extract required literals for optimization.
+        // First try prefix literals (best: enables skipping from file start).
+        // Fall back to inner literals (e.g. the '.' in \d+\.\d+) for prefiltering.
+        const req_lit = extractRequiredLiterals(ast, allocator) orelse
+            extractInnerLiteral(ast, allocator);
 
         // NFA compiler uses the real allocator since NFA states must outlive compile()
         var compiler = NfaCompiler.init(allocator);
