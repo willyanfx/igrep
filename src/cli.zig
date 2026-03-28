@@ -22,6 +22,9 @@ pub const Config = struct {
     word_regexp: bool = false,
     max_count: ?u64 = null,
     type_filter: ?[]const u8 = null,
+    /// When true, pattern is treated as a regex (default behavior).
+    /// When false (via -F), pattern is treated as a fixed literal string.
+    regex_mode: bool = true,
 
     pub fn deinit(self: *const Config, allocator: std.mem.Allocator) void {
         if (self.paths.len > 0) {
@@ -70,6 +73,13 @@ pub fn parseArgs(allocator: std.mem.Allocator) ParseError!Config {
                 config.case_sensitive = false;
             } else if (std.mem.eql(u8, arg, "-F") or std.mem.eql(u8, arg, "--fixed-strings")) {
                 config.fixed_strings = true;
+                config.regex_mode = false;
+            } else if (std.mem.eql(u8, arg, "-e") or std.mem.eql(u8, arg, "--regexp")) {
+                if (args.next()) |val| {
+                    config.pattern = val;
+                    pattern_set = true;
+                    config.regex_mode = true;
+                }
             } else if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--count")) {
                 config.count_only = true;
             } else if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--files-with-matches")) {
@@ -162,8 +172,9 @@ pub fn printUsage() void {
         \\  PATH ...         Files or directories to search (default: .)
         \\
         \\OPTIONS:
+        \\  -e, --regexp PATTERN     Use PATTERN as a regex (useful for patterns starting with -)
         \\  -i, --ignore-case        Case-insensitive search
-        \\  -F, --fixed-strings      Treat pattern as a literal string
+        \\  -F, --fixed-strings      Treat pattern as a literal string (no regex)
         \\  -v, --invert-match       Select non-matching lines
         \\  -w, --word-regexp        Match whole words only
         \\  -c, --count              Only print match counts per file

@@ -1,71 +1,75 @@
 const std = @import("std");
 const cli = @import("cli.zig");
 const literal = @import("engine/literal.zig");
+const regex_engine = @import("engine/regex.zig");
 const mmap = @import("io/mmap.zig");
 const walker = @import("io/walker.zig");
 const output_printer = @import("output/printer.zig");
-
-/// A single match result collected from worker threads.
-const MatchResult = struct {
-    file_path: []const u8,
-    line_num: u64,
-    line: []const u8,
-    context_before: []const []const u8,
-    context_after: []const []const u8,
-};
-
-/// Results for an entire file, collected by a worker thread.
-const FileResult = struct {
-    file_path: []const u8,
-    matches: []MatchResult,
-    match_count: u64,
-    allocator: std.mem.Allocator,
-
-    fn deinit(self: *FileResult) void {
-        for (self.matches) |m| {
-            for (m.context_before) |_| {}
-            for (m.context_after) |_| {}
-            self.allocator.free(m.context_before);
-            self.allocator.free(m.context_after);
-        }
-        self.allocator.free(self.matches);
-        self.allocator.free(self.file_path);
-    }
-};
+const output_buffer = @import("output/buffer.zig");
 
 /// High-level search orchestrator.
 /// Coordinates file discovery, pattern matching, and result output.
-/// Supports both single-threaded and parallel execution.
+/// Uses lock-free per-file buffering: each worker formats output into a
+/// private buffer, then a single short lock flushes it to stdout.
 pub const Searcher = struct {
     allocator: std.mem.Allocator,
     config: cli.Config,
-    result_printer: output_printer.Printer,
+    use_color: bool,
+
+    /// Direct stdout writer — used for single-threaded path and final flush target.
+    stdout_writer: *std.Io.Writer,
+
+    /// Compiled regex (null if using literal search mode).
+    compiled_regex: ?regex_engine.Regex = null,
+
+    /// True if we should use SIMD literal path (pure literal or -F mode).
+    use_literal_path: bool = true,
+
     total_matches: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    /// Mutex for serializing output from multiple threads.
+
+    /// Mutex only held during the brief stdout write of a completed file buffer.
     output_mutex: std.Thread.Mutex = .{},
 
     /// Create a Searcher. The caller must provide a pointer to a std.Io.Writer
     /// (typically backed by a buffered File.Writer) that outlives the Searcher.
-    pub fn init(allocator: std.mem.Allocator, config: cli.Config, writer: *std.Io.Writer) Searcher {
+    pub fn init(allocator: std.mem.Allocator, config: cli.Config, writer: *std.Io.Writer) !Searcher {
         const use_color = switch (config.color) {
             .always => true,
             .never => false,
             .auto => std.fs.File.stdout().supportsAnsiEscapeCodes(),
         };
 
+        var compiled: ?regex_engine.Regex = null;
+        var use_literal = true;
+
+        if (config.regex_mode and !config.fixed_strings) {
+            // Try to compile as regex
+            var re = try regex_engine.Regex.compile(allocator, config.pattern);
+            if (re.isPureLiteral()) {
+                // Pattern has no metacharacters — use fast SIMD literal path
+                re.deinit(allocator);
+                use_literal = true;
+            } else {
+                compiled = re;
+                use_literal = false;
+            }
+        }
+
         return Searcher{
             .allocator = allocator,
             .config = config,
-            .result_printer = output_printer.Printer.init(
-                writer,
-                use_color,
-                config.line_number,
-            ),
+            .use_color = use_color,
+            .stdout_writer = writer,
+            .compiled_regex = compiled,
+            .use_literal_path = use_literal,
         };
     }
 
     pub fn deinit(self: *Searcher) void {
-        self.result_printer.flush();
+        if (self.compiled_regex != null) {
+            self.compiled_regex.?.deinit(self.allocator);
+        }
+        self.stdout_writer.flush() catch {};
     }
 
     /// Execute the search across all configured paths.
@@ -94,9 +98,16 @@ pub const Searcher = struct {
         if (use_parallel) {
             try self.runParallel(file_list.items);
         } else {
+            // Single-threaded: write directly to stdout, no buffers needed
+            var direct_printer = output_printer.Printer.init(
+                self.stdout_writer,
+                self.use_color,
+                self.config.line_number,
+            );
             for (file_list.items) |file_path| {
-                self.searchAndPrintFile(file_path);
+                self.searchFile(file_path, &direct_printer);
             }
+            direct_printer.flush();
         }
 
         return self.total_matches.load(.monotonic);
@@ -158,13 +169,35 @@ pub const Searcher = struct {
     }
 
     /// Worker function executed on thread pool threads.
+    /// Each worker gets its own OutputBuffer — no lock during search/format.
     fn workerSearchFile(self: *Searcher, file_path: []const u8, wg: *std.Thread.WaitGroup) void {
         defer wg.finish();
-        self.searchAndPrintFile(file_path);
+
+        // Thread-local output buffer — formatted output goes here lock-free
+        var out_buf = output_buffer.OutputBuffer.init();
+        defer out_buf.deinit(self.allocator);
+
+        var buf_writer = output_buffer.BufferWriter.init(&out_buf, self.allocator);
+        var printer = output_printer.Printer.initBuffered(
+            &buf_writer,
+            self.use_color,
+            self.config.line_number,
+        );
+
+        self.searchFile(file_path, &printer);
+
+        // Only take the lock to flush the completed buffer to stdout
+        if (!out_buf.isEmpty()) {
+            self.output_mutex.lock();
+            defer self.output_mutex.unlock();
+            self.stdout_writer.writeAll(out_buf.slice()) catch {};
+        }
     }
 
-    /// Search a single file and print results (thread-safe via output_mutex).
-    fn searchAndPrintFile(self: *Searcher, file_path: []const u8) void {
+    /// Search a single file and write results to the provided printer.
+    /// This function is lock-free — the printer writes to whatever backend
+    /// it was initialized with (buffer for parallel, stdout for single-threaded).
+    fn searchFile(self: *Searcher, file_path: []const u8, printer: *output_printer.Printer) void {
         var mapped = mmap.MappedFile.open(file_path) catch |err| {
             switch (err) {
                 error.IsDir => return,
@@ -200,19 +233,23 @@ pub const Searcher = struct {
         var file_matches: u64 = 0;
         var last_printed_line: u64 = 0;
 
-        // Lock output for the duration of this file to keep results grouped
-        self.output_mutex.lock();
-        defer self.output_mutex.unlock();
-
         for (contents, 0..) |byte, i| {
             if (byte == '\n' or i == contents.len - 1) {
                 const line_end = if (byte == '\n') i else i + 1;
                 const line = contents[line_start..line_end];
 
-                const matched = if (self.config.case_sensitive)
-                    literal.contains(line, pattern)
+                const matched = if (self.use_literal_path)
+                    // Fast SIMD literal path
+                    (if (self.config.case_sensitive)
+                        literal.contains(line, pattern)
+                    else
+                        literal.containsCaseInsensitive(line, pattern))
                 else
-                    literal.containsCaseInsensitive(line, pattern);
+                    // Regex NFA path
+                    (if (self.compiled_regex) |*re|
+                        (re.isMatch(line, self.allocator) catch false)
+                    else
+                        false);
 
                 const should_report = if (self.config.invert_match) !matched else matched;
 
@@ -229,14 +266,14 @@ pub const Searcher = struct {
 
                             // Separator between non-contiguous context groups
                             if (last_printed_line > 0 and start_idx + 1 > last_printed_line + 1) {
-                                self.result_printer.printSeparator() catch {};
+                                printer.printSeparator() catch {};
                             }
 
                             var ctx_i = start_idx;
                             while (ctx_i < current_idx) : (ctx_i += 1) {
                                 if (ctx_i + 1 > last_printed_line) {
                                     const ctx_line = lines_buf.items[ctx_i];
-                                    self.result_printer.printContext(
+                                    printer.printContext(
                                         file_path,
                                         ctx_i + 1,
                                         contents[ctx_line.start..ctx_line.end],
@@ -246,7 +283,7 @@ pub const Searcher = struct {
                             }
                         }
 
-                        self.result_printer.printMatch(
+                        printer.printMatch(
                             file_path,
                             line_num,
                             line,
@@ -265,7 +302,7 @@ pub const Searcher = struct {
                             while (ctx_i < end_idx) : (ctx_i += 1) {
                                 if (ctx_i + 1 > last_printed_line) {
                                     const ctx_line = lines_buf.items[ctx_i];
-                                    self.result_printer.printContext(
+                                    printer.printContext(
                                         file_path,
                                         ctx_i + 1,
                                         contents[ctx_line.start..ctx_line.end],
@@ -287,11 +324,11 @@ pub const Searcher = struct {
         }
 
         if (self.config.files_only and file_matches > 0) {
-            self.result_printer.printFilePath(file_path) catch {};
+            printer.printFilePath(file_path) catch {};
         }
 
         if (self.config.count_only and file_matches > 0) {
-            self.result_printer.printCount(file_path, file_matches) catch {};
+            printer.printCount(file_path, file_matches) catch {};
         }
     }
 

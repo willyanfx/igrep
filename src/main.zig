@@ -31,7 +31,11 @@ pub fn main() !void {
     var out_buf: [8192]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&out_buf);
 
-    var search_engine = searcher.Searcher.init(allocator, config, &stdout_writer.interface);
+    var search_engine = searcher.Searcher.init(allocator, config, &stdout_writer.interface) catch |err| {
+        const stderr = std.fs.File.stderr().deprecatedWriter();
+        stderr.print("igrep: error compiling pattern: {}\n", .{err}) catch {};
+        std.process.exit(2);
+    };
     defer search_engine.deinit();
 
     const match_count = try search_engine.run();
@@ -49,10 +53,12 @@ test {
     _ = @import("cli.zig");
     _ = @import("searcher.zig");
     _ = @import("engine/literal.zig");
+    _ = @import("engine/regex.zig");
     _ = @import("io/mmap.zig");
     _ = @import("io/walker.zig");
     _ = @import("io/gitignore.zig");
     _ = @import("output/printer.zig");
+    _ = @import("output/buffer.zig");
     _ = @import("util/pool.zig");
     _ = @import("util/simd.zig");
 }
