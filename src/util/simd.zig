@@ -41,6 +41,33 @@ pub fn findByte(vec: @Vector(VECTOR_LEN, u8), needle_byte: u8) ?u4 {
     return @intCast(@ctz(mask));
 }
 
+/// Find the next occurrence of `byte` in `data` starting from `start`.
+/// Uses SIMD to scan 16 bytes at a time, falls back to scalar for the tail.
+pub fn findNextByte(data: []const u8, byte: u8, start: usize) ?usize {
+    if (start >= data.len) return null;
+
+    var pos = start;
+    const needle_vec: @Vector(VECTOR_LEN, u8) = @splat(byte);
+
+    // SIMD scan: 16 bytes at a time
+    while (pos + VECTOR_LEN <= data.len) {
+        const chunk: @Vector(VECTOR_LEN, u8) = data[pos..][0..VECTOR_LEN].*;
+        const matches = chunk == needle_vec;
+        const mask = movemask(matches);
+        if (mask != 0) {
+            return pos + @as(usize, @ctz(mask));
+        }
+        pos += VECTOR_LEN;
+    }
+
+    // Scalar tail
+    while (pos < data.len) {
+        if (data[pos] == byte) return pos;
+        pos += 1;
+    }
+    return null;
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 test "splat creates uniform vector" {
@@ -71,4 +98,18 @@ test "findByte finds first occurrence" {
     const pos = findByte(vec, 'o');
     try std.testing.expect(pos != null);
     try std.testing.expectEqual(@as(u4, 4), pos.?);
+}
+
+test "findNextByte finds newlines" {
+    const data = "line one\nline two\nline three\n";
+    try std.testing.expectEqual(@as(?usize, 8), findNextByte(data, '\n', 0));
+    try std.testing.expectEqual(@as(?usize, 17), findNextByte(data, '\n', 9));
+    try std.testing.expectEqual(@as(?usize, 28), findNextByte(data, '\n', 18));
+    try std.testing.expectEqual(@as(?usize, null), findNextByte(data, '\n', 29));
+}
+
+test "findNextByte works with data longer than VECTOR_LEN" {
+    const data = "0123456789abcdef\nmore data after newline\n";
+    try std.testing.expectEqual(@as(?usize, 16), findNextByte(data, '\n', 0));
+    try std.testing.expectEqual(@as(?usize, 40), findNextByte(data, '\n', 17));
 }

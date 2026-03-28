@@ -2,10 +2,15 @@ const std = @import("std");
 const cli = @import("cli.zig");
 const literal = @import("engine/literal.zig");
 const regex_engine = @import("engine/regex.zig");
+const simd_utils = @import("util/simd.zig");
 const mmap = @import("io/mmap.zig");
 const walker = @import("io/walker.zig");
 const output_printer = @import("output/printer.zig");
 const output_buffer = @import("output/buffer.zig");
+const index_builder = @import("index/builder.zig");
+const index_store = @import("index/store.zig");
+const index_query = @import("index/query.zig");
+const index_cache = @import("index/cache.zig");
 
 /// High-level search orchestrator.
 /// Coordinates file discovery, pattern matching, and result output.
@@ -72,10 +77,35 @@ pub const Searcher = struct {
         self.stdout_writer.flush() catch {};
     }
 
+    /// Build the trigram index for the given paths (--index-build mode).
+    pub fn buildIndex(self: *Searcher) !void {
+        const stderr = std.fs.File.stderr().deprecatedWriter();
+        const root = if (self.config.paths.len > 0) self.config.paths[0] else ".";
+
+        stderr.print("igrep: building trigram index for {s}...\n", .{root}) catch {};
+
+        var idx = try index_builder.buildIndex(self.allocator, self.config.paths, self.config.max_depth);
+        defer idx.deinit();
+
+        try index_store.writeIndex(&idx, root, self.allocator);
+
+        const size = index_cache.indexSize(root, self.allocator) orelse 0;
+        stderr.print("igrep: indexed {d} files, {d} trigrams, {d} KB on disk\n", .{
+            idx.file_count,
+            @as(u32, @intCast(idx.postings.count())),
+            size / 1024,
+        }) catch {};
+    }
+
     /// Execute the search across all configured paths.
     /// Returns total number of matching lines.
     pub fn run(self: *Searcher) !u64 {
-        // Collect all files to search
+        // Indexed search path: use trigram index to find candidates first
+        if (self.config.use_index) {
+            return try self.runIndexed();
+        }
+
+        // Standard path: collect all files and search
         var file_list: std.ArrayList([]const u8) = .{};
         defer {
             for (file_list.items) |p| self.allocator.free(p);
@@ -105,6 +135,70 @@ pub const Searcher = struct {
                 self.config.line_number,
             );
             for (file_list.items) |file_path| {
+                self.searchFile(file_path, &direct_printer);
+            }
+            direct_printer.flush();
+        }
+
+        return self.total_matches.load(.monotonic);
+    }
+
+    /// Indexed search: load index, query candidates, search only those files.
+    fn runIndexed(self: *Searcher) !u64 {
+        const root = if (self.config.paths.len > 0) self.config.paths[0] else ".";
+        const stderr = std.fs.File.stderr().deprecatedWriter();
+
+        // Auto-build if index doesn't exist or is stale
+        if (!index_store.indexExists(root, self.allocator) or
+            index_cache.isStale(root, self.allocator))
+        {
+            stderr.print("igrep: index missing or stale, building...\n", .{}) catch {};
+            try self.buildIndex();
+        }
+
+        // Load the index
+        var idx = index_store.readIndex(root, self.allocator) catch |err| {
+            stderr.print("igrep: failed to load index: {}, falling back to full scan\n", .{err}) catch {};
+            return error.InvalidIndex;
+        };
+        defer idx.deinit();
+
+        // Query for candidate files
+        var result = try index_query.queryCandidates(&idx, self.config.pattern, self.allocator);
+        defer result.deinit();
+
+        stderr.print("igrep: index query: {d}/{d} candidate files\n", .{
+            result.file_ids.len,
+            idx.file_count,
+        }) catch {};
+
+        if (result.file_ids.len == 0) {
+            return 0;
+        }
+
+        // Search only candidate files
+        const use_parallel = result.file_ids.len > 4 and
+            (self.config.threads == null or self.config.threads.? > 1);
+
+        // Build file path list from candidate IDs
+        var candidates: std.ArrayList([]const u8) = .{};
+        defer if (candidates.capacity > 0) candidates.deinit(self.allocator);
+
+        for (result.file_ids) |file_id| {
+            if (file_id < idx.file_count) {
+                try candidates.append(self.allocator, idx.file_paths[file_id]);
+            }
+        }
+
+        if (use_parallel) {
+            try self.runParallel(candidates.items);
+        } else {
+            var direct_printer = output_printer.Printer.init(
+                self.stdout_writer,
+                self.use_color,
+                self.config.line_number,
+            );
+            for (candidates.items) |file_path| {
                 self.searchFile(file_path, &direct_printer);
             }
             direct_printer.flush();
@@ -233,10 +327,11 @@ pub const Searcher = struct {
         var file_matches: u64 = 0;
         var last_printed_line: u64 = 0;
 
-        for (contents, 0..) |byte, i| {
-            if (byte == '\n' or i == contents.len - 1) {
-                const line_end = if (byte == '\n') i else i + 1;
-                const line = contents[line_start..line_end];
+        // SIMD-accelerated line iteration: scan 16 bytes at a time for '\n'
+        while (line_start < contents.len) {
+            const nl_pos = simd_utils.findNextByte(contents, '\n', line_start);
+            const line_end = nl_pos orelse contents.len;
+            const line = contents[line_start..line_end];
 
                 const matched = if (self.use_literal_path)
                     // Fast SIMD literal path
@@ -318,10 +413,9 @@ pub const Searcher = struct {
                     }
                 }
 
-                line_start = i + 1;
+                line_start = line_end + 1;
                 line_num += 1;
-            }
-        }
+            } // end while
 
         if (self.config.files_only and file_matches > 0) {
             printer.printFilePath(file_path) catch {};

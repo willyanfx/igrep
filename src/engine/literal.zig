@@ -14,7 +14,8 @@ pub fn contains(haystack: []const u8, needle: []const u8) bool {
     if (needle.len > haystack.len) return false;
 
     if (needle.len == 1) {
-        return std.mem.indexOfScalar(u8, haystack, needle[0]) != null;
+        // Use SIMD byte scan for single-byte patterns
+        return simd_utils.findNextByte(haystack, needle[0], 0) != null;
     }
 
     return findFirst(haystack, needle) != null;
@@ -165,9 +166,10 @@ pub fn findAll(
 
 // ── Internal Implementation ──────────────────────────────────────────
 
-/// SIMD search using the "first and last byte" technique.
-/// Scans for positions where both the first and last bytes of the needle
-/// match simultaneously, then verifies the full needle at candidate positions.
+/// SIMD search using the "first, middle, and last byte" technique.
+/// Scans for positions where the first and last bytes of the needle
+/// match simultaneously, with an optional middle byte check to reduce
+/// false positives for longer patterns. Then verifies full match at candidates.
 fn simdFindFirstLastPair(
     haystack: []const u8,
     needle: []const u8,
@@ -177,6 +179,11 @@ fn simdFindFirstLastPair(
     const Vec = @Vector(simd_utils.VECTOR_LEN, u8);
     const first_vec: Vec = @splat(first_byte);
     const last_vec: Vec = @splat(last_byte);
+
+    // For patterns >= 4 bytes, also check a middle byte to cut false positives
+    const use_mid = needle.len >= 4;
+    const mid_offset = needle.len / 2;
+    const mid_vec: Vec = if (use_mid) @splat(needle[mid_offset]) else @splat(@as(u8, 0));
 
     const search_end = haystack.len - needle.len + 1;
     var i: usize = 0;
@@ -192,11 +199,14 @@ fn simdFindFirstLastPair(
         const last_match: @Vector(simd_utils.VECTOR_LEN, bool) = last_chunk == last_vec;
 
         // AND the masks: positions where both first and last byte match
-        const first_bits = simd_utils.movemask(first_match);
-        const last_bits = simd_utils.movemask(last_match);
+        var mask = simd_utils.movemask(first_match) & simd_utils.movemask(last_match);
 
-        // Convert bool vector to bitmask
-        var mask = first_bits & last_bits;
+        // Additional middle byte filter for longer patterns
+        if (use_mid and mask != 0) {
+            const mid_chunk: Vec = haystack[i + mid_offset ..][0..simd_utils.VECTOR_LEN].*;
+            const mid_match: @Vector(simd_utils.VECTOR_LEN, bool) = mid_chunk == mid_vec;
+            mask &= simd_utils.movemask(mid_match);
+        }
 
         // Check each candidate position
         while (mask != 0) {

@@ -38,7 +38,27 @@ pub fn main() !void {
     };
     defer search_engine.deinit();
 
-    const match_count = try search_engine.run();
+    // Index build mode: build index and exit
+    if (config.build_index) {
+        search_engine.buildIndex() catch |err| {
+            const stderr = std.fs.File.stderr().deprecatedWriter();
+            stderr.print("igrep: index build failed: {}\n", .{err}) catch {};
+            std.process.exit(2);
+        };
+        return;
+    }
+
+    const match_count = search_engine.run() catch |err| {
+        // If indexed search fails, fall back to full scan
+        if (err == error.InvalidIndex) {
+            var fallback = search_engine;
+            fallback.config.use_index = false;
+            const count = try fallback.run();
+            if (count == 0) std.process.exit(1);
+            return;
+        }
+        return err;
+    };
 
     // Exit code follows grep convention: 0 = matches found, 1 = no matches
     if (match_count == 0) {
@@ -59,6 +79,10 @@ test {
     _ = @import("io/gitignore.zig");
     _ = @import("output/printer.zig");
     _ = @import("output/buffer.zig");
+    _ = @import("index/builder.zig");
+    _ = @import("index/store.zig");
+    _ = @import("index/query.zig");
+    _ = @import("index/cache.zig");
     _ = @import("util/pool.zig");
     _ = @import("util/simd.zig");
 }

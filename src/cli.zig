@@ -15,6 +15,7 @@ pub const Config = struct {
     max_depth: ?u32 = null,
     threads: ?u32 = null,
     use_index: bool = false,
+    build_index: bool = false,
     json_output: bool = false,
     include_globs: []const []const u8 = &.{},
     exclude_globs: []const []const u8 = &.{},
@@ -96,6 +97,8 @@ pub fn parseArgs(allocator: std.mem.Allocator) ParseError!Config {
                 config.json_output = true;
             } else if (std.mem.eql(u8, arg, "--index")) {
                 config.use_index = true;
+            } else if (std.mem.eql(u8, arg, "--index-build")) {
+                config.build_index = true;
             } else if (std.mem.eql(u8, arg, "--color") or std.mem.eql(u8, arg, "--colour")) {
                 if (args.next()) |val| {
                     if (std.mem.eql(u8, val, "always")) {
@@ -190,7 +193,8 @@ pub fn printUsage() void {
         \\  --max-depth N            Max directory recursion depth
         \\  --color [always|never|auto]  Control color output
         \\  --json                   Output results as JSON
-        \\  --index                  Use trigram index for search
+        \\  --index                  Use trigram index for search (auto-builds if missing)
+        \\  --index-build            Build/rebuild the trigram index without searching
         \\  -h, --help               Show this help
         \\  -V, --version            Show version
         \\

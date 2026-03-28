@@ -30,11 +30,11 @@ pub fn nextCharMask(char: u8) u8 {
 /// Check if a bloom entry could match at a given position with a given next character.
 pub fn mightMatch(entry: BloomEntry, position: usize, next_char: ?u8) bool {
     // Check location mask
-    if (entry.loc_mask & locationMask(position) == 0) return false;
+    if ((entry.loc_mask & locationMask(position)) == 0) return false;
 
     // Check next character mask (if applicable)
     if (next_char) |nc| {
-        if (entry.next_mask & nextCharMask(nc) == 0) return false;
+        if ((entry.next_mask & nextCharMask(nc)) == 0) return false;
     }
 
     return true;
