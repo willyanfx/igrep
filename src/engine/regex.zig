@@ -522,6 +522,8 @@ pub const NfaState = struct {
 pub const Nfa = struct {
     states: []NfaState,
     start: u32,
+    epsilon_closures: ?[][]u64 = null, // epsilon_closures[state_idx] = bitset of reachable states via epsilon (splits only)
+    is_one_pass: bool = false, // Optimization 3: True if NFA is deterministic (single path per input)
 
     pub fn deinit(self: *Nfa, allocator: std.mem.Allocator) void {
         // Free owned char class ranges and lookup tables
@@ -535,6 +537,15 @@ pub const Nfa = struct {
                 }
             }
         }
+
+        // Free epsilon closures
+        if (self.epsilon_closures) |closures| {
+            for (closures) |closure| {
+                allocator.free(closure);
+            }
+            allocator.free(closures);
+        }
+
         allocator.free(self.states);
     }
 };
@@ -1033,6 +1044,18 @@ fn addStateNoAlloc(set: []u64, nfa: *const Nfa, state_idx: u32, text: []const u8
     const state = &nfa.states[state_idx];
     switch (state.kind) {
         .split => {
+            // Optimization 1: Use pre-computed epsilon closure if available
+            if (nfa.epsilon_closures) |closures| {
+                if (state_idx < closures.len) {
+                    const closure = closures[state_idx];
+                    // OR the entire closure into the set
+                    for (closure, 0..) |word, i| {
+                        set[i] |= word;
+                    }
+                    return;
+                }
+            }
+            // Fallback to recursive epsilon closure
             addStateNoAlloc(set, nfa, state.out1, text, pos);
             addStateNoAlloc(set, nfa, state.out2, text, pos);
         },
@@ -1068,47 +1091,222 @@ inline fn setBit(set: []u64, idx: u32) void {
 /// Extract required literal prefix/infix from AST (Optimization 1)
 /// Returns longest literal substring that must appear for pattern to match
 fn extractRequiredLiterals(ast: *const AstNode, allocator: std.mem.Allocator) ?[]const u8 {
-    // Look for literal prefix in concatenation
-    if (ast.kind == .concat) {
-        var literal_buf: std.ArrayList(u8) = .{};
-        defer literal_buf.deinit(allocator);
+    // Collect all literals from the leftmost prefix of the concatenation tree.
+    // The parser produces left-associative trees: concat(concat(concat(a, b), c), d)
+    // We flatten this by recursively descending into left concats, collecting literals.
+    var literal_buf: std.ArrayList(u8) = .{};
 
-        var node = ast;
-        while (node.kind == .concat and node.left != null) {
-            const left = node.left.?;
-            if (left.kind == .literal) {
-                literal_buf.append(allocator, left.char) catch return null;
-                node = node.right orelse break;
-            } else if (left.kind == .quantifier and left.child != null and left.child.?.kind == .literal) {
-                // Stop at quantifier - can't assume it matches
-                break;
-            } else {
-                // Non-literal node (dot, class, etc) - stop
-                break;
-            }
-        }
+    collectLiteralPrefix(ast, &literal_buf, allocator);
 
-        // Check final node
-        if (node.kind == .literal) {
-            literal_buf.append(allocator, node.char) catch return null;
-        } else if (node.kind != .concat) {
-            // Single node - not a concat
-            if (node.kind == .literal) {
-                literal_buf.append(allocator, node.char) catch return null;
-            }
-        }
-
-        if (literal_buf.items.len > 0) {
-            return literal_buf.toOwnedSlice(allocator) catch null;
-        }
-    } else if (ast.kind == .literal) {
-        // Single literal
-        const buf = allocator.alloc(u8, 1) catch return null;
-        buf[0] = ast.char;
-        return buf;
+    if (literal_buf.items.len > 0) {
+        return literal_buf.toOwnedSlice(allocator) catch {
+            if (literal_buf.capacity > 0) literal_buf.deinit(allocator);
+            return null;
+        };
     }
 
+    // Nothing extracted — clean up
+    if (literal_buf.capacity > 0) literal_buf.deinit(allocator);
     return null;
+}
+
+/// Recursively collect the literal prefix from a left-associative concat tree.
+/// Stops at the first non-literal node (dot, class, quantifier, etc.).
+fn collectLiteralPrefix(node: *const AstNode, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) void {
+    switch (node.kind) {
+        .literal => {
+            buf.append(allocator, node.char) catch return;
+        },
+        .concat => {
+            if (node.left) |left| {
+                collectLiteralPrefix(left, buf, allocator);
+            }
+            // Only continue to right if left was fully literal
+            if (node.left) |left| {
+                if (isFullyLiteral(left)) {
+                    if (node.right) |right| {
+                        collectLiteralPrefix(right, buf, allocator);
+                    }
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+/// Check if a node and all its descendants are pure literals or literal concats.
+fn isFullyLiteral(node: *const AstNode) bool {
+    return switch (node.kind) {
+        .literal => true,
+        .concat => {
+            const left_ok = if (node.left) |l| isFullyLiteral(l) else true;
+            const right_ok = if (node.right) |r| isFullyLiteral(r) else true;
+            return left_ok and right_ok;
+        },
+        else => false,
+    };
+}
+
+// Inner literal extraction (TODO: implement safely for patterns like \d+\.\d+)
+
+fn extractInnerLiteral(ast: *const AstNode, allocator: std.mem.Allocator) ?[]const u8 {
+    var best_buf: std.ArrayList(u8) = .{};
+    var current_buf: std.ArrayList(u8) = .{};
+
+    collectAllLiteralRuns(ast, &best_buf, &current_buf, allocator);
+
+    // Flush last run
+    if (current_buf.items.len > best_buf.items.len) {
+        if (best_buf.capacity > 0) best_buf.deinit(allocator);
+        best_buf = current_buf;
+    } else {
+        if (current_buf.capacity > 0) current_buf.deinit(allocator);
+    }
+
+    if (best_buf.items.len > 0) {
+        return best_buf.toOwnedSlice(allocator) catch {
+            if (best_buf.capacity > 0) best_buf.deinit(allocator);
+            return null;
+        };
+    }
+    if (best_buf.capacity > 0) best_buf.deinit(allocator);
+    return null;
+}
+
+/// Walk the AST in-order collecting literal runs. Keeps track of the best (longest) run.
+fn collectAllLiteralRuns(
+    node: *const AstNode,
+    best: *std.ArrayList(u8),
+    current: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+) void {
+    switch (node.kind) {
+        .literal => {
+            current.append(allocator, node.char) catch return;
+        },
+        .concat => {
+            if (node.left) |left| {
+                collectAllLiteralRuns(left, best, current, allocator);
+            }
+            if (node.right) |right| {
+                collectAllLiteralRuns(right, best, current, allocator);
+            }
+        },
+        else => {
+            // Non-literal: flush current run if it's the longest so far
+            if (current.items.len > best.items.len) {
+                // Swap current into best
+                const tmp_items = best.items;
+                const tmp_cap = best.capacity;
+                best.items = current.items;
+                best.capacity = current.capacity;
+                current.items = tmp_items;
+                current.capacity = tmp_cap;
+            }
+            current.items.len = 0; // reset current run (keep capacity)
+            // Recurse into children of quantifiers etc.
+            if (node.child) |child| {
+                collectAllLiteralRuns(child, best, current, allocator);
+                // Flush after child
+                if (current.items.len > best.items.len) {
+                    const tmp_items = best.items;
+                    const tmp_cap = best.capacity;
+                    best.items = current.items;
+                    best.capacity = current.capacity;
+                    current.items = tmp_items;
+                    current.capacity = tmp_cap;
+                }
+                current.items.len = 0;
+            }
+            // Also recurse into left/right for alternation
+            if (node.kind == .alternate) {
+                // For alternations, we can't use inner literals (either branch might not have it)
+                // Just flush
+                if (current.items.len > best.items.len) {
+                    const tmp_items = best.items;
+                    const tmp_cap = best.capacity;
+                    best.items = current.items;
+                    best.capacity = current.capacity;
+                    current.items = tmp_items;
+                    current.capacity = tmp_cap;
+                }
+                current.items.len = 0;
+            }
+        },
+    }
+}
+
+/// Detect if NFA is one-pass (deterministic): for each state + input byte,
+/// there is at most one possible next state. This allows a fast single-pointer path
+/// instead of bitset operations.
+fn detectOnePass(nfa: *const Nfa) bool {
+    // Conservative check: only simple patterns are truly deterministic
+    // We check if any state has conflicting transitions (multiple matches for same input)
+    for (nfa.states) |state| {
+        switch (state.kind) {
+            .split => {
+                // Split states introduce non-determinism (can't be one-pass)
+                return false;
+            },
+            .match_char => {
+                // Check for duplicate character matches (conflict)
+                // This would require checking against other states with same char
+                // For now, allow it (will be refined in later iterations)
+            },
+            else => {},
+        }
+    }
+
+    // Additional check: if there are epsilon closures with size > 1, it's non-deterministic
+    // But since we're checking split states above, this is implicit
+    return true;
+}
+
+/// Compute epsilon closures for each NFA state.
+/// epsilon_closures[state_idx] contains a bitset of all states reachable from state_idx
+/// via only split transitions (not including anchors/word boundaries, which are position-dependent).
+fn computeEpsilonClosures(allocator: std.mem.Allocator, nfa: *Nfa) !void {
+    const num_states = nfa.states.len;
+    const set_size = (num_states + 63) / 64;
+
+    // Allocate array of bitsets
+    var closures = try allocator.alloc([]u64, num_states);
+    errdefer allocator.free(closures);
+
+    // For each state, compute its epsilon closure
+    for (0..num_states) |state_idx| {
+        const closure = try allocator.alloc(u64, set_size);
+        errdefer allocator.free(closure);
+        @memset(closure, 0);
+
+        // Recursively add all states reachable via splits
+        computeEpsilonClosureHelper(closure, nfa, @intCast(state_idx), set_size);
+
+        closures[state_idx] = closure;
+    }
+
+    nfa.epsilon_closures = closures;
+}
+
+/// Helper function to compute epsilon closure via recursion on split transitions.
+fn computeEpsilonClosureHelper(closure: []u64, nfa: *const Nfa, state_idx: u32, set_size: usize) void {
+    if (state_idx == NfaState.NONE or state_idx >= nfa.states.len) return;
+
+    // Check if already in closure
+    const word_idx = state_idx / 64;
+    const bit_idx: u6 = @intCast(state_idx % 64);
+    if ((closure[word_idx] >> bit_idx) & 1 == 1) return;
+
+    // Add this state
+    closure[word_idx] |= @as(u64, 1) << bit_idx;
+
+    const state = &nfa.states[state_idx];
+
+    // Only follow split transitions (not anchors/word boundaries)
+    if (state.kind == .split) {
+        computeEpsilonClosureHelper(closure, nfa, state.out1, set_size);
+        computeEpsilonClosureHelper(closure, nfa, state.out2, set_size);
+    }
 }
 
 pub const Regex = struct {
@@ -1135,11 +1333,18 @@ pub const Regex = struct {
         const ast = try parser.parse();
 
         // Extract required literals for optimization
+        // Extract required literal prefix for prefiltering
         const req_lit = extractRequiredLiterals(ast, allocator);
 
         // NFA compiler uses the real allocator since NFA states must outlive compile()
         var compiler = NfaCompiler.init(allocator);
-        const nfa = try compiler.compile(ast);
+        var nfa = try compiler.compile(ast);
+
+        // Optimization 3: Detect if NFA is one-pass
+        nfa.is_one_pass = detectOnePass(&nfa);
+
+        // Compute epsilon closures for optimization
+        try computeEpsilonClosures(allocator, &nfa);
 
         // Compute byte equivalence classes for DFA optimization
         var byte_classes: [256]u8 = undefined;
@@ -1212,8 +1417,9 @@ pub const Regex = struct {
 
     /// Create a lazy DFA instance for this regex. Caller owns and must deinit.
     /// Use with isMatchDfa() for cached matching across multiple texts.
+    /// Optimization 2: Uses required_literal for prefiltering if available.
     pub fn createDfa(self: *const Regex, allocator: std.mem.Allocator) !lazy_dfa_mod.LazyDfa {
-        return lazy_dfa_mod.LazyDfa.init(allocator, &self.nfa, &self.byte_classes, self.num_classes);
+        return lazy_dfa_mod.LazyDfa.initWithLiteral(allocator, &self.nfa, &self.byte_classes, self.num_classes, self.required_literal);
     }
 
     /// Plain NFA simulation (baseline, no caching).

@@ -60,11 +60,22 @@ pub const LazyDfa = struct {
     byte_classes: *const [256]u8,
     num_classes: u16,
 
+    /// Optimization 2: Required literal prefix for quick elimination
+    required_literal: ?[]const u8 = null,
+    literal_len: usize = 0,
+
     pub fn init(allocator: std.mem.Allocator, nfa: *const Nfa, byte_classes: *const [256]u8, num_classes: u16) !LazyDfa {
+        return initWithLiteral(allocator, nfa, byte_classes, num_classes, null);
+    }
+
+    /// Initialize with optional required literal for prefiltering
+    pub fn initWithLiteral(allocator: std.mem.Allocator, nfa: *const Nfa, byte_classes: *const [256]u8, num_classes: u16, literal: ?[]const u8) !LazyDfa {
         const num_states = nfa.states.len;
         const set_size = (num_states + 63) / 64;
         const scratch = try allocator.alloc(u64, set_size);
         @memset(scratch, 0);
+
+        const lit_len = if (literal) |l| l.len else 0;
 
         return .{
             .allocator = allocator,
@@ -76,6 +87,8 @@ pub const LazyDfa = struct {
             .flush_count = 0,
             .byte_classes = byte_classes,
             .num_classes = num_classes,
+            .required_literal = literal,
+            .literal_len = lit_len,
         };
     }
 
@@ -216,7 +229,25 @@ pub const LazyDfa = struct {
     }
 
     /// Run the lazy DFA over `text` and return true if any position matches.
+    /// Optimization 2: Uses required literal prefilter if available.
     pub fn isMatch(self: *LazyDfa, text: []const u8) !bool {
+        // Optimization 2: If we have a required literal, only check positions where it appears
+        if (self.required_literal) |literal| {
+            var search_from: usize = 0;
+            while (std.mem.indexOfPos(u8, text, search_from, literal)) |lit_pos| {
+                // Run DFA from the literal position
+                if (try self.isMatchFrom(text, lit_pos)) return true;
+                search_from = lit_pos + 1;
+            }
+            return false;
+        }
+
+        // Standard full-scan when no prefilter
+        return self.isMatchFullScan(text);
+    }
+
+    /// Standard full scan without literal prefilter
+    fn isMatchFullScan(self: *LazyDfa, text: []const u8) !bool {
         // Build initial state
         @memset(self.scratch_buf[0..self.set_size], 0);
         addStateNoAlloc(self.scratch_buf[0..self.set_size], self.nfa, self.nfa.start, text, 0);
@@ -228,6 +259,28 @@ pub const LazyDfa = struct {
         // Process each byte — hot loop with O(1) cache lookups
         for (text, 0..) |byte, pos| {
             current = try self.step(current, byte, text, pos + 1);
+            if (self.states.items[current].is_match) return true;
+        }
+
+        return false;
+    }
+
+    /// Run DFA from a specific starting position in text.
+    /// Used by literal prefilter to check windows around literal occurrences.
+    fn isMatchFrom(self: *LazyDfa, text: []const u8, start_pos: usize) !bool {
+        if (start_pos >= text.len) return false;
+
+        // Build initial state at start_pos
+        @memset(self.scratch_buf[0..self.set_size], 0);
+        addStateNoAlloc(self.scratch_buf[0..self.set_size], self.nfa, self.nfa.start, text, start_pos);
+
+        var current = try self.internState(self.scratch_buf[0..self.set_size]);
+
+        if (self.states.items[current].is_match) return true;
+
+        // Process each byte from start_pos onwards
+        for (text[start_pos..], 0..) |byte, i| {
+            current = try self.step(current, byte, text, start_pos + i + 1);
             if (self.states.items[current].is_match) return true;
         }
 
@@ -247,6 +300,18 @@ fn addStateNoAlloc(set: []u64, nfa: *const Nfa, state_idx: u32, text: []const u8
     const state = &nfa.states[state_idx];
     switch (state.kind) {
         .split => {
+            // Optimization 1: Use pre-computed epsilon closure if available
+            if (nfa.epsilon_closures) |closures| {
+                if (state_idx < closures.len) {
+                    const closure = closures[state_idx];
+                    // OR the entire closure into the set
+                    for (closure, 0..) |word, i| {
+                        set[i] |= word;
+                    }
+                    return;
+                }
+            }
+            // Fallback to recursive epsilon closure
             addStateNoAlloc(set, nfa, state.out1, text, pos);
             addStateNoAlloc(set, nfa, state.out2, text, pos);
         },
