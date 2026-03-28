@@ -1,0 +1,124 @@
+{%- comment -%}
+  Featured collection section — displays a grid of products from a chosen collection.
+  Commonly placed on the homepage to highlight bestsellers or new arrivals.
+  TODO: add "view all" link behavior option (button vs text link)
+{%- endcomment -%}
+
+{%- liquid
+  assign collection = collections[section.settings.collection]
+  assign products_to_show = section.settings.products_to_show
+  assign columns = section.settings.columns_desktop
+-%}
+
+<div class="section-{{ section.id }} featured-collection page-width">
+  {%- if section.settings.title != blank -%}
+    <div class="featured-collection__header">
+      <h2 class="featured-collection__title {{ section.settings.heading_size }}">
+        {{ section.settings.title | escape }}
+      </h2>
+
+      {%- if section.settings.show_view_all and collection.products.size > products_to_show -%}
+        <a href="{{ collection.url }}" class="featured-collection__view-all link">
+          {{ 'sections.featured_collection.view_all' | t }}
+        </a>
+      {%- endif -%}
+    </div>
+  {%- endif -%}
+
+  <ul class="featured-collection__grid grid grid--{{ columns }}-col" role="list">
+    {%- for product in collection.products limit: products_to_show -%}
+      <li class="featured-collection__item grid__item">
+        {%- render 'product-card',
+          product: product,
+          show_vendor: section.settings.show_vendor,
+          show_rating: section.settings.show_rating,
+          lazy_load: forloop.index > 4
+        -%}
+      </li>
+    {%- else -%}
+      {%- comment -%} Placeholder cards when no collection selected {%- endcomment -%}
+      {%- for i in (1..products_to_show) -%}
+        <li class="featured-collection__item grid__item">
+          <div class="product-card product-card--placeholder">
+            {{ 'product-' | append: forloop.index | placeholder_svg_tag }}
+            <h3>{{ 'onboarding.product_title' | t }}</h3>
+            <span class="price">{{ 1999 | money }}</span>
+          </div>
+        </li>
+      {%- endfor -%}
+    {%- endfor -%}
+  </ul>
+</div>
+
+{% schema %}
+{
+  "name": "Featured collection",
+  "tag": "section",
+  "class": "section-featured-collection",
+  "settings": [
+    {
+      "type": "text",
+      "id": "title",
+      "label": "Heading",
+      "default": "Featured collection"
+    },
+    {
+      "type": "select",
+      "id": "heading_size",
+      "label": "Heading size",
+      "options": [
+        { "value": "h2", "label": "Small" },
+        { "value": "h1", "label": "Medium" },
+        { "value": "h0", "label": "Large" }
+      ],
+      "default": "h1"
+    },
+    {
+      "type": "collection",
+      "id": "collection",
+      "label": "Collection"
+    },
+    {
+      "type": "range",
+      "id": "products_to_show",
+      "min": 2,
+      "max": 12,
+      "step": 1,
+      "default": 4,
+      "label": "Products to show"
+    },
+    {
+      "type": "range",
+      "id": "columns_desktop",
+      "min": 2,
+      "max": 5,
+      "step": 1,
+      "default": 4,
+      "label": "Desktop columns"
+    },
+    {
+      "type": "checkbox",
+      "id": "show_vendor",
+      "label": "Show vendor",
+      "default": false
+    },
+    {
+      "type": "checkbox",
+      "id": "show_rating",
+      "label": "Show product rating",
+      "default": false
+    },
+    {
+      "type": "checkbox",
+      "id": "show_view_all",
+      "label": "Show 'View all' link",
+      "default": true
+    }
+  ],
+  "presets": [
+    {
+      "name": "Featured collection"
+    }
+  ]
+}
+{% endschema %}

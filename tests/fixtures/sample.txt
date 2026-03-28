@@ -1,0 +1,10 @@
+This is a test file for instantGrep.
+It contains several lines of text.
+Some lines have the word TODO in them.
+Others mention FIXME or HACK.
+The quick brown fox jumps over the lazy dog.
+fn main() !void { }
+pub const VERSION = "0.1.0";
+// This is a comment with a TODO marker
+Hello, World!
+The end.

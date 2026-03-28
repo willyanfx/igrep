@@ -1,0 +1,58 @@
+This file tests edge cases for the search engine.
+
+=== Empty lines around matches ===
+
+TODO on a line by itself
+
+TODO surrounded by empty lines above and below
+
+=== Case sensitivity ===
+todo lowercase
+TODO UPPERCASE
+Todo Mixed Case
+tOdO alternating case
+
+=== Multiple matches per line ===
+TODO and another TODO and yet another TODO on the same line
+
+=== Very short lines ===
+a
+b
+TODO
+d
+e
+
+=== Special characters near matches ===
+(TODO) in parentheses
+[TODO] in brackets
+{TODO} in braces
+"TODO" in quotes
+'TODO' in single quotes
+<TODO> in angle brackets
+TODO: with colon
+TODO; with semicolon
+#TODO as hashtag
+@TODO as mention
+!TODO with bang
+TODO? with question
+TODO... with ellipsis
+
+=== Unicode content ===
+日本語のテスト with TODO marker
+Ünïcödé with FIXME note
+Ελληνικά with HACK comment
+Кириллица with TODO item
+🔍 Search TODO with emoji prefix
+
+=== Patterns that look like regex ===
+match this: foo.*bar
+and this: [a-z]+
+also: \d{3}-\d{4}
+regex TODO: (capture|group)
+
+=== Long line for SIMD boundary testing ===
+This is a very long line that is specifically designed to be longer than sixteen bytes which is the SIMD vector width so that the SIMD search path is definitely exercised when searching for the word TODO in this particular line of text that just keeps going and going and going until it is quite long indeed
+
+=== Matches at buffer boundaries ===
+abcdefghijklmnopTODOqrstuvwxyz
+0123456789abcdefTODO0123456789abcdef

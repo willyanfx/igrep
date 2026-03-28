@@ -1,0 +1,122 @@
+{%- comment -%}
+  Collection template with filtering, sorting, and pagination.
+  TODO: add support for metafield-based custom filters
+  FIXME: pagination breaks when filters reduce results below page size
+{%- endcomment -%}
+
+{%- paginate collection.products by 24 -%}
+
+<div class="collection" data-collection-handle="{{ collection.handle }}">
+  <div class="collection__header">
+    <h1 class="collection__title">{{ collection.title | escape }}</h1>
+
+    {%- if collection.description != blank -%}
+      <div class="collection__description rte">
+        {{ collection.description }}
+      </div>
+    {%- endif -%}
+
+    <div class="collection__count">
+      {{ 'collections.general.items_with_count' | t: count: collection.products_count }}
+    </div>
+  </div>
+
+  {%- if section.settings.enable_filtering or section.settings.enable_sorting -%}
+    <div class="collection__toolbar">
+      {%- if section.settings.enable_filtering -%}
+        {%- render 'facets',
+          results: collection,
+          enable_filtering: section.settings.enable_filtering,
+          filter_type: section.settings.filter_type
+        -%}
+      {%- endif -%}
+
+      {%- if section.settings.enable_sorting -%}
+        <div class="collection__sort">
+          <label for="SortBy">{{ 'collections.sorting.title' | t }}</label>
+          {%- assign sort_by = collection.sort_by | default: collection.default_sort_by -%}
+          <select id="SortBy" data-sort-select>
+            {%- for option in collection.sort_options -%}
+              <option
+                value="{{ option.value }}"
+                {% if sort_by == option.value %}selected{% endif %}
+              >
+                {{ option.name }}
+              </option>
+            {%- endfor -%}
+          </select>
+        </div>
+      {%- endif -%}
+    </div>
+  {%- endif -%}
+
+  {%- if collection.products.size > 0 -%}
+    <ul class="collection__grid grid" role="list">
+      {%- for product in collection.products -%}
+        <li class="collection__item grid__item">
+          {%- render 'product-card',
+            product: product,
+            show_vendor: section.settings.show_vendor,
+            show_rating: section.settings.show_rating,
+            lazy_load: true
+          -%}
+        </li>
+      {%- endfor -%}
+    </ul>
+  {%- else -%}
+    <p class="collection__empty">
+      {{ 'collections.general.no_matches' | t }}
+    </p>
+  {%- endif -%}
+
+  {%- if paginate.pages > 1 -%}
+    {%- render 'pagination', paginate: paginate -%}
+  {%- endif -%}
+</div>
+
+{%- endpaginate -%}
+
+{% schema %}
+{
+  "name": "Collection Grid",
+  "tag": "section",
+  "class": "section-collection",
+  "settings": [
+    {
+      "type": "checkbox",
+      "id": "enable_filtering",
+      "label": "Enable filtering",
+      "default": true
+    },
+    {
+      "type": "checkbox",
+      "id": "enable_sorting",
+      "label": "Enable sorting",
+      "default": true
+    },
+    {
+      "type": "select",
+      "id": "filter_type",
+      "label": "Filter style",
+      "options": [
+        { "value": "horizontal", "label": "Horizontal" },
+        { "value": "vertical", "label": "Vertical" },
+        { "value": "drawer", "label": "Drawer" }
+      ],
+      "default": "horizontal"
+    },
+    {
+      "type": "checkbox",
+      "id": "show_vendor",
+      "label": "Show vendor",
+      "default": false
+    },
+    {
+      "type": "checkbox",
+      "id": "show_rating",
+      "label": "Show product rating",
+      "default": false
+    }
+  ]
+}
+{% endschema %}

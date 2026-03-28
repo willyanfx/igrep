@@ -1,0 +1,58 @@
+const std = @import("std");
+const searcher = @import("searcher.zig");
+const cli = @import("cli.zig");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const config = cli.parseArgs(allocator) catch |err| {
+        switch (err) {
+            error.ShowHelp => {
+                cli.printUsage();
+                return;
+            },
+            error.ShowVersion => {
+                const stdout = std.fs.File.stdout().deprecatedWriter();
+                try stdout.print("instantGrep {s}\n", .{version});
+                return;
+            },
+            else => {
+                const stderr = std.fs.File.stderr().deprecatedWriter();
+                try stderr.print("igrep: error parsing arguments\n", .{});
+                std.process.exit(1);
+            },
+        }
+    };
+    defer config.deinit(allocator);
+
+    // Create buffered stdout writer — owned by main, outlives Searcher
+    var out_buf: [8192]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&out_buf);
+
+    var search_engine = searcher.Searcher.init(allocator, config, &stdout_writer.interface);
+    defer search_engine.deinit();
+
+    const match_count = try search_engine.run();
+
+    // Exit code follows grep convention: 0 = matches found, 1 = no matches
+    if (match_count == 0) {
+        std.process.exit(1);
+    }
+}
+
+pub const version = "0.1.0";
+
+// Pull in all modules for testing
+test {
+    _ = @import("cli.zig");
+    _ = @import("searcher.zig");
+    _ = @import("engine/literal.zig");
+    _ = @import("io/mmap.zig");
+    _ = @import("io/walker.zig");
+    _ = @import("io/gitignore.zig");
+    _ = @import("output/printer.zig");
+    _ = @import("util/pool.zig");
+    _ = @import("util/simd.zig");
+}

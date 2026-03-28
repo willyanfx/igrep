@@ -1,0 +1,120 @@
+{%- comment -%}
+  Product card snippet — used in collection grids, featured collections,
+  search results, and product recommendations.
+
+  Accepts:
+    - product: {Object} Shopify product object
+    - show_vendor: {Boolean} Show product vendor
+    - show_rating: {Boolean} Show product rating
+    - lazy_load: {Boolean} Lazy load the product image
+    - card_style: {String} 'standard' | 'compact'
+
+  Usage:
+    {%- render 'product-card', product: product, show_vendor: true -%}
+
+  TODO: add quick-add button for simple products (single variant)
+  TODO: add wishlist toggle icon
+{%- endcomment -%}
+
+{%- liquid
+  assign card_style = card_style | default: 'standard'
+  assign ratio = 1
+  if product.featured_image and product.featured_image.aspect_ratio > 0
+    assign ratio = product.featured_image.aspect_ratio
+  endif
+-%}
+
+<div class="product-card product-card--{{ card_style }}" data-product-id="{{ product.id }}">
+  <a href="{{ product.url }}" class="product-card__link" aria-label="{{ product.title | escape }}">
+    <div class="product-card__media" style="--ratio: {{ ratio }}">
+      {%- if product.featured_image -%}
+        {{
+          product.featured_image
+          | image_url: width: 600
+          | image_tag:
+            class: 'product-card__image motion-reduce',
+            widths: '165, 360, 535, 600',
+            sizes: '(min-width: 1200px) 267px, (min-width: 750px) 25vw, 50vw',
+            alt: product.featured_image.alt | escape,
+            loading: lazy_load | default: false | ternary: 'lazy', 'eager'
+        }}
+
+        {%- if product.media.size > 1 and section.settings.show_secondary_image -%}
+          {{
+            product.media[1]
+            | image_url: width: 600
+            | image_tag:
+              class: 'product-card__image product-card__image--hover motion-reduce',
+              widths: '165, 360, 535, 600',
+              sizes: '(min-width: 1200px) 267px, (min-width: 750px) 25vw, 50vw',
+              alt: product.media[1].alt | escape,
+              loading: 'lazy'
+          }}
+        {%- endif -%}
+      {%- else -%}
+        <div class="product-card__placeholder">
+          {{ 'product-1' | placeholder_svg_tag: 'placeholder-svg' }}
+        </div>
+      {%- endif -%}
+
+      {%- if product.available == false -%}
+        <span class="product-card__badge badge badge--sold-out">
+          {{ 'products.product.sold_out' | t }}
+        </span>
+      {%- elsif product.compare_at_price > product.price -%}
+        {%- liquid
+          assign savings = product.compare_at_price | minus: product.price
+          assign savings_pct = savings | times: 100.0 | divided_by: product.compare_at_price | round
+        -%}
+        <span class="product-card__badge badge badge--sale">
+          {{ 'products.product.on_sale' | t }} -{{ savings_pct }}%
+        </span>
+      {%- endif -%}
+    </div>
+
+    <div class="product-card__info">
+      {%- if show_vendor -%}
+        <span class="product-card__vendor caption-with-letter-spacing">
+          {{ product.vendor }}
+        </span>
+      {%- endif -%}
+
+      <h3 class="product-card__title">
+        {{ product.title | escape }}
+      </h3>
+
+      {%- render 'price', product: product, show_compare: true -%}
+
+      {%- if show_rating and product.metafields.reviews.rating.value != blank -%}
+        {%- liquid
+          assign rating_value = product.metafields.reviews.rating.value.rating
+          assign rating_max = product.metafields.reviews.rating.value.scale_max
+          assign rating_count = product.metafields.reviews.rating_count.value
+        -%}
+        <div class="product-card__rating" role="img" aria-label="{{ 'accessibility.star_reviews_info' | t: rating_value: rating_value, rating_max: rating_max }}">
+          {%- render 'rating-stars', rating: rating_value, max: rating_max -%}
+          <span class="product-card__rating-count">({{ rating_count }})</span>
+        </div>
+      {%- endif -%}
+
+      {%- comment -%} HACK: color swatches in card — hardcoded to 'Color' option name {%- endcomment -%}
+      {%- if product.options_by_name['Color'].values.size > 1 -%}
+        <div class="product-card__swatches">
+          {%- for color in product.options_by_name['Color'].values -%}
+            {%- if forloop.index <= 5 -%}
+              <span
+                class="product-card__swatch"
+                style="background-color: {{ color | handleize }}"
+                title="{{ color }}"
+              ></span>
+            {%- endif -%}
+          {%- endfor -%}
+          {%- assign remaining = product.options_by_name['Color'].values.size | minus: 5 -%}
+          {%- if remaining > 0 -%}
+            <span class="product-card__swatch-more">+{{ remaining }}</span>
+          {%- endif -%}
+        </div>
+      {%- endif -%}
+    </div>
+  </a>
+</div>

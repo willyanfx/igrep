@@ -1,0 +1,127 @@
+{%- comment -%}
+  Product template — renders product details, variant selector, and add-to-cart.
+  TODO: add structured data (JSON-LD) for SEO
+  TODO: support metafield-driven tabs for specifications
+{%- endcomment -%}
+
+{%- assign current_variant = product.selected_or_first_available_variant -%}
+{%- assign featured_image = current_variant.featured_image | default: product.featured_image -%}
+
+<div class="product" data-product-id="{{ product.id }}">
+  {%- section 'product-media-gallery' -%}
+
+  <div class="product__info-wrapper">
+    <div class="product__title">
+      {%- if collection -%}
+        <a href="{{ collection.url }}" class="product__collection-link">{{ collection.title }}</a>
+      {%- endif -%}
+
+      <h1 class="product__name">{{ product.title | escape }}</h1>
+
+      {%- if product.vendor -%}
+        <span class="product__vendor">{{ product.vendor | link_to_vendor }}</span>
+      {%- endif -%}
+    </div>
+
+    {%- render 'price', product: product, variant: current_variant, show_compare: true -%}
+
+    {%- if product.has_only_default_variant == false -%}
+      <div class="product__variants">
+        {%- for option in product.options_with_values -%}
+          <div class="product__option" data-option-index="{{ forloop.index0 }}">
+            <label for="Option-{{ section.id }}-{{ forloop.index0 }}">
+              {{ option.name }}
+            </label>
+
+            {%- if option.name == 'Color' or option.name == 'Colour' -%}
+              {%- render 'swatch-selector',
+                option: option,
+                section_id: section.id,
+                option_index: forloop.index0
+              -%}
+            {%- else -%}
+              <select
+                id="Option-{{ section.id }}-{{ forloop.index0 }}"
+                name="options[{{ option.name | escape }}]"
+                class="product__option-select"
+              >
+                {%- for value in option.values -%}
+                  <option
+                    value="{{ value | escape }}"
+                    {% if option.selected_value == value %}selected{% endif %}
+                  >
+                    {{ value }}
+                  </option>
+                {%- endfor -%}
+              </select>
+            {%- endif -%}
+          </div>
+        {%- endfor -%}
+      </div>
+    {%- endif -%}
+
+    {%- comment -%} FIXME: quantity selector should respect inventory policy {%- endcomment -%}
+    {%- render 'quantity-selector', variant: current_variant -%}
+
+    {%- form 'product', product, id: 'product-form', data-product-form: '' -%}
+      <input type="hidden" name="id" value="{{ current_variant.id }}">
+
+      <button
+        type="submit"
+        class="product__submit button button--primary"
+        {% unless current_variant.available %}disabled{% endunless %}
+      >
+        {%- if current_variant.available -%}
+          {{ 'products.product.add_to_cart' | t }}
+          <span class="product__price">
+            {{ current_variant.price | money }}
+          </span>
+        {%- else -%}
+          {{ 'products.product.sold_out' | t }}
+        {%- endif -%}
+      </button>
+
+      {%- if settings.enable_dynamic_checkout -%}
+        {{ form | payment_button }}
+      {%- endif -%}
+    {%- endform -%}
+
+    {%- if product.description != blank -%}
+      <div class="product__description rte">
+        {{ product.description }}
+      </div>
+    {%- endif -%}
+
+    {%- comment -%}
+      HACK: using metafields for nutrition info until we have a proper
+      product tab system. This is specific to FitFoods product pages.
+    {%- endcomment -%}
+    {%- if product.metafields.custom.nutrition_facts -%}
+      <div class="product__nutrition">
+        <h3>{{ 'products.product.nutrition_facts' | t }}</h3>
+        {{ product.metafields.custom.nutrition_facts | metafield_tag }}
+      </div>
+    {%- endif -%}
+  </div>
+</div>
+
+<script type="application/ld+json">
+  {
+    "@context": "https://schema.org/",
+    "@type": "Product",
+    "name": {{ product.title | json }},
+    "image": {{ featured_image | image_url: width: 1024 | json }},
+    "description": {{ product.description | strip_html | truncate: 200 | json }},
+    "brand": {
+      "@type": "Brand",
+      "name": {{ product.vendor | json }}
+    },
+    "offers": {
+      "@type": "Offer",
+      "url": {{ request.origin | append: product.url | json }},
+      "priceCurrency": {{ cart.currency.iso_code | json }},
+      "price": {{ current_variant.price | divided_by: 100.0 | json }},
+      "availability": "https://schema.org/{% if current_variant.available %}InStock{% else %}OutOfStock{% endif %}"
+    }
+  }
+</script>

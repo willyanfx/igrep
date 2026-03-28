@@ -1,0 +1,157 @@
+{%- comment -%}
+  Site header with logo, navigation, cart icon, and search.
+  TODO: add mega-menu support for deeply nested navigation
+  TODO: add announcement bar rotation with multiple messages
+{%- endcomment -%}
+
+{%- if section.settings.announcement_text != blank -%}
+  <div class="announcement-bar" role="region" aria-label="{{ 'sections.header.announcement' | t }}">
+    <p class="announcement-bar__message">
+      {%- if section.settings.announcement_link != blank -%}
+        <a href="{{ section.settings.announcement_link }}">
+          {{ section.settings.announcement_text }}
+        </a>
+      {%- else -%}
+        {{ section.settings.announcement_text }}
+      {%- endif -%}
+    </p>
+  </div>
+{%- endif -%}
+
+<header class="header header--{{ section.settings.logo_position }}" role="banner">
+  <div class="header__wrapper page-width">
+    {%- comment -%} Logo {%- endcomment -%}
+    <div class="header__logo">
+      <a href="/" class="header__logo-link">
+        {%- if section.settings.logo -%}
+          {%- assign logo_alt = section.settings.logo.alt | default: shop.name | escape -%}
+          {%- assign logo_height = section.settings.logo_width | divided_by: section.settings.logo.aspect_ratio -%}
+          {{
+            section.settings.logo
+            | image_url: width: 500
+            | image_tag:
+              class: 'header__logo-image',
+              widths: '150, 200, 300, 400, 500',
+              height: logo_height,
+              width: section.settings.logo_width,
+              alt: logo_alt,
+              loading: 'eager'
+          }}
+        {%- else -%}
+          <span class="header__logo-text h2">{{ shop.name }}</span>
+        {%- endif -%}
+      </a>
+    </div>
+
+    {%- comment -%} Navigation {%- endcomment -%}
+    <nav class="header__nav" aria-label="{{ 'sections.header.navigation' | t }}">
+      <ul class="header__menu list-unstyled" role="list">
+        {%- for link in section.settings.menu.links -%}
+          <li class="header__menu-item{% if link.child_links.size > 0 %} header__menu-item--has-children{% endif %}">
+            {%- if link.child_links.size > 0 -%}
+              <details class="header__submenu-wrapper">
+                <summary class="header__menu-link">
+                  {{ link.title | escape }}
+                  {%- render 'icon-caret' -%}
+                </summary>
+                <ul class="header__submenu list-unstyled" role="list">
+                  {%- for child_link in link.child_links -%}
+                    <li>
+                      <a href="{{ child_link.url }}" class="header__submenu-link"
+                        {% if child_link.current %} aria-current="page"{% endif %}
+                      >
+                        {{ child_link.title | escape }}
+                      </a>
+                    </li>
+                  {%- endfor -%}
+                </ul>
+              </details>
+            {%- else -%}
+              <a href="{{ link.url }}" class="header__menu-link"
+                {% if link.current %} aria-current="page"{% endif %}
+              >
+                {{ link.title | escape }}
+              </a>
+            {%- endif -%}
+          </li>
+        {%- endfor -%}
+      </ul>
+    </nav>
+
+    {%- comment -%} Search + Cart icons {%- endcomment -%}
+    <div class="header__icons">
+      <a href="{{ routes.search_url }}" class="header__icon header__icon--search" aria-label="{{ 'general.search.search' | t }}">
+        {%- render 'icon-search' -%}
+      </a>
+
+      <a href="{{ routes.cart_url }}" class="header__icon header__icon--cart" aria-label="{{ 'sections.cart.title' | t }}">
+        {%- render 'icon-cart' -%}
+        {%- if cart.item_count > 0 -%}
+          <span class="header__cart-count badge">
+            {{ cart.item_count }}
+          </span>
+        {%- endif -%}
+      </a>
+
+      {%- comment -%} FIXME: mobile menu button should trap focus when open {%- endcomment -%}
+      <button
+        class="header__icon header__icon--menu"
+        aria-label="{{ 'sections.header.menu' | t }}"
+        aria-expanded="false"
+        data-menu-toggle
+      >
+        {%- render 'icon-hamburger' -%}
+      </button>
+    </div>
+  </div>
+</header>
+
+{% schema %}
+{
+  "name": "Header",
+  "class": "section-header",
+  "settings": [
+    {
+      "type": "image_picker",
+      "id": "logo",
+      "label": "Logo image"
+    },
+    {
+      "type": "range",
+      "id": "logo_width",
+      "min": 50,
+      "max": 300,
+      "step": 10,
+      "default": 120,
+      "unit": "px",
+      "label": "Logo width"
+    },
+    {
+      "type": "select",
+      "id": "logo_position",
+      "label": "Logo position",
+      "options": [
+        { "value": "left", "label": "Left" },
+        { "value": "center", "label": "Center" }
+      ],
+      "default": "left"
+    },
+    {
+      "type": "link_list",
+      "id": "menu",
+      "label": "Menu",
+      "default": "main-menu"
+    },
+    {
+      "type": "text",
+      "id": "announcement_text",
+      "label": "Announcement text"
+    },
+    {
+      "type": "url",
+      "id": "announcement_link",
+      "label": "Announcement link"
+    }
+  ]
+}
+{% endschema %}

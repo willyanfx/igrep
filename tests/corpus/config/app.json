@@ -1,0 +1,36 @@
+{
+  "app": {
+    "name": "CodeSearch",
+    "version": "0.1.0",
+    "environment": "development"
+  },
+  "server": {
+    "port": 8080,
+    "host": "0.0.0.0",
+    "timeout_seconds": 30
+  },
+  "database": {
+    "url": "postgresql://localhost:5432/codesearch",
+    "max_connections": 20,
+    "ssl": false
+  },
+  "search": {
+    "max_results": 1000,
+    "context_lines": 3,
+    "trigram_index": {
+      "enabled": true,
+      "bloom_filter_bits": 65536,
+      "bloom_hash_count": 3,
+      "min_file_size": 64,
+      "max_file_size": 10485760
+    },
+    "simd": {
+      "enabled": true,
+      "vector_width": 16
+    }
+  },
+  "logging": {
+    "level": "info",
+    "format": "json"
+  }
+}

@@ -1,0 +1,62 @@
+{%- comment -%}
+  Price snippet — renders product price with compare-at and sale logic.
+
+  Accepts:
+    - product: {Object} Shopify product object
+    - variant: {Object} Specific variant (optional, defaults to first available)
+    - show_compare: {Boolean} Show compare-at / strikethrough price
+
+  Usage:
+    {%- render 'price', product: product, variant: current_variant, show_compare: true -%}
+{%- endcomment -%}
+
+{%- liquid
+  assign target = variant | default: product.selected_or_first_available_variant
+  assign compare_at_price = target.compare_at_price
+  assign price = target.price
+  assign on_sale = false
+  if compare_at_price > price
+    assign on_sale = true
+  endif
+  assign price_varies = false
+  if product.price_varies
+    assign price_varies = true
+  endif
+-%}
+
+<div class="price{% if on_sale %} price--on-sale{% endif %}{% unless target.available %} price--sold-out{% endunless %}">
+  <div class="price__regular">
+    {%- if price_varies -%}
+      <span class="price__label visually-hidden">
+        {{ 'products.product.price.from_price_html' | t: price: '' }}
+      </span>
+    {%- endif -%}
+
+    <span class="price__amount price__amount--regular">
+      {{ price | money }}
+    </span>
+  </div>
+
+  {%- if show_compare and on_sale -%}
+    <div class="price__sale">
+      <span class="price__amount price__amount--sale">
+        {{ price | money }}
+      </span>
+      <span class="price__amount price__amount--compare">
+        <s>{{ compare_at_price | money }}</s>
+      </span>
+
+      {%- comment -%} TODO: show unit price for products sold by weight/volume {%- endcomment -%}
+      {%- if target.unit_price_measurement -%}
+        <span class="price__unit">
+          {{ target.unit_price | money }}
+          <span aria-hidden="true">/</span>
+          {%- if target.unit_price_measurement.reference_value != 1 -%}
+            {{ target.unit_price_measurement.reference_value }}
+          {%- endif -%}
+          {{ target.unit_price_measurement.reference_unit }}
+        </span>
+      {%- endif -%}
+    </div>
+  {%- endif -%}
+</div>

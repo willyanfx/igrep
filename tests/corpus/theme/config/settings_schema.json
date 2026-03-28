@@ -1,0 +1,97 @@
+[
+  {
+    "name": "theme_info",
+    "theme_name": "FitFoods Theme",
+    "theme_version": "3.2.0",
+    "theme_author": "FitFoods Dev Team",
+    "theme_documentation_url": "https://docs.fitfoods.ca/theme",
+    "theme_support_url": "https://support.fitfoods.ca"
+  },
+  {
+    "name": "Typography",
+    "settings": [
+      {
+        "type": "font_picker",
+        "id": "type_body_font",
+        "label": "Body font",
+        "default": "assistant_n4"
+      },
+      {
+        "type": "font_picker",
+        "id": "type_header_font",
+        "label": "Heading font",
+        "default": "assistant_n7"
+      },
+      {
+        "type": "range",
+        "id": "body_scale",
+        "min": -2,
+        "max": 2,
+        "step": 1,
+        "default": 0,
+        "label": "Body font size scale"
+      },
+      {
+        "type": "range",
+        "id": "heading_scale",
+        "min": -2,
+        "max": 2,
+        "step": 1,
+        "default": 0,
+        "label": "Heading font size scale"
+      }
+    ]
+  },
+  {
+    "name": "Colors",
+    "settings": [
+      {
+        "type": "color",
+        "id": "colors_text",
+        "label": "Text",
+        "default": "#1a1a2e"
+      },
+      {
+        "type": "color",
+        "id": "colors_background_1",
+        "label": "Background",
+        "default": "#ffffff"
+      },
+      {
+        "type": "color",
+        "id": "colors_accent_1",
+        "label": "Accent 1",
+        "default": "#4ecdc4"
+      },
+      {
+        "type": "color",
+        "id": "colors_accent_2",
+        "label": "Accent 2",
+        "default": "#ff6b6b"
+      }
+    ]
+  },
+  {
+    "name": "Cart",
+    "settings": [
+      {
+        "type": "select",
+        "id": "cart_type",
+        "label": "Cart type",
+        "options": [
+          { "value": "drawer", "label": "Drawer" },
+          { "value": "page", "label": "Page" },
+          { "value": "notification", "label": "Popup notification" }
+        ],
+        "default": "drawer"
+      },
+      {
+        "type": "checkbox",
+        "id": "enable_dynamic_checkout",
+        "label": "Show dynamic checkout buttons",
+        "info": "Each customer will see their preferred payment method from those available on your store, such as PayPal or Apple Pay.",
+        "default": true
+      }
+    ]
+  }
+]
