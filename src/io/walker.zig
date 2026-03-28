@@ -9,6 +9,9 @@ pub const DirWalker = struct {
     max_depth: ?u32,
     stack: std.ArrayList(StackEntry) = .{},
     ignore_rules: gitignore.GitIgnore,
+    /// Arena allocator for path strings: bump-allocated during traversal,
+    /// freed once at deinit. Eliminates per-file allocation overhead.
+    arena: std.heap.ArenaAllocator,
 
     const StackEntry = struct {
         iter: std.fs.Dir.Iterator,
@@ -47,6 +50,7 @@ pub const DirWalker = struct {
             .root_path = clean_root,
             .max_depth = max_depth,
             .ignore_rules = gitignore.GitIgnore.init(allocator),
+            .arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
 
@@ -57,16 +61,20 @@ pub const DirWalker = struct {
         }
         if (self.stack.capacity > 0) self.stack.deinit(self.allocator);
         self.ignore_rules.deinit();
+        self.arena.deinit();
     }
 
     /// Get the next file path, or null when traversal is complete.
     /// Caller owns the returned string and must free it.
+    /// Uses an internal arena for temporary path strings to amortize allocation cost.
     pub fn next(self: *DirWalker) !?[]const u8 {
         // Lazy initialization: push root directory on first call
         if (self.stack.items.len == 0 and self.stack.capacity == 0) {
             try self.pushDir(self.root_path, 0, "");
             self.ignore_rules.loadFromDir(self.root_path) catch {};
         }
+
+        const arena_allocator = self.arena.allocator();
 
         while (self.stack.items.len > 0) {
             const top = &self.stack.items[self.stack.items.len - 1];
@@ -75,69 +83,59 @@ pub const DirWalker = struct {
                 const name = entry.name;
 
                 const full_path = if (top.prefix.len > 0)
-                    try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ top.prefix, name })
+                    try std.fmt.allocPrint(arena_allocator, "{s}/{s}", .{ top.prefix, name })
                 else
-                    try self.allocator.dupe(u8, name);
+                    try arena_allocator.dupe(u8, name);
 
                 if (entry.kind == .directory) {
                     if (shouldSkipDir(name)) {
-                        self.allocator.free(full_path);
                         continue;
                     }
 
                     if (self.max_depth) |max| {
                         if (top.depth + 1 > max) {
-                            self.allocator.free(full_path);
                             continue;
                         }
                     }
 
                     const dir_path_with_slash = try std.fmt.allocPrint(
-                        self.allocator,
+                        arena_allocator,
                         "{s}/",
                         .{full_path},
                     );
-                    defer self.allocator.free(dir_path_with_slash);
 
                     if (self.ignore_rules.isIgnored(dir_path_with_slash)) {
-                        self.allocator.free(full_path);
                         continue;
                     }
 
                     const depth = top.depth + 1;
                     const abs_path = try std.fmt.allocPrint(
-                        self.allocator,
+                        arena_allocator,
                         "{s}/{s}",
                         .{ self.root_path, full_path },
                     );
-                    defer self.allocator.free(abs_path);
                     self.pushDir(abs_path, depth, full_path) catch {
-                        self.allocator.free(full_path);
                         continue;
                     };
                     // Load nested .gitignore rules from the new directory
                     self.ignore_rules.loadFromDir(abs_path) catch {};
-                    // full_path content was duped inside pushDir, free our copy
-                    self.allocator.free(full_path);
                     continue;
                 }
 
                 if (entry.kind == .file) {
                     if (self.ignore_rules.isIgnored(full_path)) {
-                        self.allocator.free(full_path);
                         continue;
                     }
 
+                    // Return result from general allocator so caller can free it
                     const result = try std.fmt.allocPrint(
                         self.allocator,
                         "{s}/{s}",
                         .{ self.root_path, full_path },
                     );
-                    self.allocator.free(full_path);
                     return result;
                 }
 
-                self.allocator.free(full_path);
                 continue;
             } else {
                 if (self.stack.pop()) |entry| {

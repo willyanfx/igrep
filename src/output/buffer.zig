@@ -10,6 +10,13 @@ pub const OutputBuffer = struct {
         return .{ .data = .{} };
     }
 
+    /// Initialize with an optional initial capacity hint to avoid early reallocations.
+    pub fn initWithCapacity(allocator: std.mem.Allocator, capacity: usize) !OutputBuffer {
+        var list = std.ArrayList(u8){};
+        try list.ensureTotalCapacity(allocator, capacity);
+        return .{ .data = list };
+    }
+
     pub fn deinit(self: *OutputBuffer, allocator: std.mem.Allocator) void {
         if (self.data.capacity > 0) self.data.deinit(allocator);
     }

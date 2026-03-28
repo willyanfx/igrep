@@ -1,4 +1,5 @@
 const std = @import("std");
+const lazy_dfa_mod = @import("lazy_dfa.zig");
 
 /// Regex engine using Thompson NFA construction.
 ///
@@ -513,8 +514,9 @@ pub const NfaState = struct {
     negated: bool = false,
     out1: u32 = NONE,
     out2: u32 = NONE, // only for split states
+    class_lut: ?*const [256]bool = null, // Lookup table for fast character class matching
 
-    const NONE: u32 = std.math.maxInt(u32);
+    pub const NONE: u32 = std.math.maxInt(u32);
 };
 
 pub const Nfa = struct {
@@ -522,10 +524,15 @@ pub const Nfa = struct {
     start: u32,
 
     pub fn deinit(self: *Nfa, allocator: std.mem.Allocator) void {
-        // Free owned char class ranges
+        // Free owned char class ranges and lookup tables
         for (self.states) |state| {
-            if (state.kind == .match_class and state.ranges.len > 0) {
-                allocator.free(state.ranges);
+            if (state.kind == .match_class) {
+                if (state.ranges.len > 0) {
+                    allocator.free(state.ranges);
+                }
+                if (state.class_lut) |lut| {
+                    allocator.destroy(lut);
+                }
             }
         }
         allocator.free(self.states);
@@ -614,10 +621,26 @@ pub const NfaCompiler = struct {
     fn compileCharClass(self: *NfaCompiler, node: *const AstNode) !Fragment {
         // Dupe ranges into the compiler's allocator so they outlive the AST arena
         const owned_ranges = try self.allocator.dupe(CharRange, node.ranges);
+
+        // Pre-compute lookup table for all 256 bytes
+        const lut = try self.allocator.create([256]bool);
+        for (0..256) |byte_idx| {
+            const byte: u8 = @intCast(byte_idx);
+            var in_class = false;
+            for (owned_ranges) |range| {
+                if (byte >= range.low and byte <= range.high) {
+                    in_class = true;
+                    break;
+                }
+            }
+            lut[byte_idx] = if (node.negated) !in_class else in_class;
+        }
+
         const idx = try self.addState(.{
             .kind = .match_class,
             .ranges = owned_ranges,
             .negated = node.negated,
+            .class_lut = lut,
         });
         var patch: std.ArrayList(PatchEntry) = .{};
         try patch.append(self.allocator, .{ .state_idx = idx, .which = .out1 });
@@ -905,7 +928,8 @@ pub const NfaExecutor = struct {
                             }
                         },
                         .match_class => {
-                            if (matchCharClass(ch, state.ranges, state.negated)) {
+                            const matches = if (state.class_lut) |lut| lut[ch] else matchCharClass(ch, state.ranges, state.negated);
+                            if (matches) {
                                 self.addState(next_buf, state.out1, text, pos + 1);
                             }
                         },
@@ -997,11 +1021,105 @@ fn isWordChar(c: u8) bool {
 
 // ── High-level Regex API ─────────────────────────────────────────────
 
+/// Add a state and follow epsilon transitions (split, anchors)
+/// Doesn't allocate - uses passed buffer and NFA reference
+fn addStateNoAlloc(set: []u64, nfa: *const Nfa, state_idx: u32, text: []const u8, pos: usize) void {
+    if (state_idx == NfaState.NONE) return;
+    if (state_idx >= nfa.states.len) return;
+    if (getBit(set, state_idx)) return; // already in set
+
+    setBit(set, state_idx);
+
+    const state = &nfa.states[state_idx];
+    switch (state.kind) {
+        .split => {
+            addStateNoAlloc(set, nfa, state.out1, text, pos);
+            addStateNoAlloc(set, nfa, state.out2, text, pos);
+        },
+        .anchor_start => {
+            if (pos == 0 or (pos > 0 and text[pos - 1] == '\n')) {
+                addStateNoAlloc(set, nfa, state.out1, text, pos);
+            }
+        },
+        .anchor_end => {
+            if (pos >= text.len or text[pos] == '\n') {
+                addStateNoAlloc(set, nfa, state.out1, text, pos);
+            }
+        },
+        .word_boundary => {
+            const before_word = pos > 0 and isWordChar(text[pos - 1]);
+            const after_word = pos < text.len and isWordChar(text[pos]);
+            if (before_word != after_word) {
+                addStateNoAlloc(set, nfa, state.out1, text, pos);
+            }
+        },
+        else => {},
+    }
+}
+
+inline fn getBit(set: []const u64, idx: u32) bool {
+    return (set[idx / 64] >> @intCast(idx % 64)) & 1 == 1;
+}
+
+inline fn setBit(set: []u64, idx: u32) void {
+    set[idx / 64] |= @as(u64, 1) << @intCast(idx % 64);
+}
+
+/// Extract required literal prefix/infix from AST (Optimization 1)
+/// Returns longest literal substring that must appear for pattern to match
+fn extractRequiredLiterals(ast: *const AstNode, allocator: std.mem.Allocator) ?[]const u8 {
+    // Look for literal prefix in concatenation
+    if (ast.kind == .concat) {
+        var literal_buf: std.ArrayList(u8) = .{};
+        defer literal_buf.deinit(allocator);
+
+        var node = ast;
+        while (node.kind == .concat and node.left != null) {
+            const left = node.left.?;
+            if (left.kind == .literal) {
+                literal_buf.append(allocator, left.char) catch return null;
+                node = node.right orelse break;
+            } else if (left.kind == .quantifier and left.child != null and left.child.?.kind == .literal) {
+                // Stop at quantifier - can't assume it matches
+                break;
+            } else {
+                // Non-literal node (dot, class, etc) - stop
+                break;
+            }
+        }
+
+        // Check final node
+        if (node.kind == .literal) {
+            literal_buf.append(allocator, node.char) catch return null;
+        } else if (node.kind != .concat) {
+            // Single node - not a concat
+            if (node.kind == .literal) {
+                literal_buf.append(allocator, node.char) catch return null;
+            }
+        }
+
+        if (literal_buf.items.len > 0) {
+            return literal_buf.toOwnedSlice(allocator) catch null;
+        }
+    } else if (ast.kind == .literal) {
+        // Single literal
+        const buf = allocator.alloc(u8, 1) catch return null;
+        buf[0] = ast.char;
+        return buf;
+    }
+
+    return null;
+}
+
 pub const Regex = struct {
     pattern: []const u8,
     nfa: Nfa,
     is_literal: bool,
     literal_str: []const u8,
+    required_literal: ?[]const u8,
+    allocator: std.mem.Allocator,
+    byte_classes: [256]u8 = undefined, // Maps byte -> equivalence class ID
+    num_classes: u16 = 256, // Number of distinct byte equivalence classes
 
     pub fn compile(allocator: std.mem.Allocator, pattern: []const u8) !Regex {
         // Detect if pattern is purely literal (no metacharacters)
@@ -1016,31 +1134,155 @@ pub const Regex = struct {
         var parser = Parser.init(arena, pattern);
         const ast = try parser.parse();
 
+        // Extract required literals for optimization
+        const req_lit = extractRequiredLiterals(ast, allocator);
+
         // NFA compiler uses the real allocator since NFA states must outlive compile()
         var compiler = NfaCompiler.init(allocator);
         const nfa = try compiler.compile(ast);
+
+        // Compute byte equivalence classes for DFA optimization
+        var byte_classes: [256]u8 = undefined;
+        var num_classes: u16 = 0;
+        _ = computeByteClasses(&nfa, &byte_classes, &num_classes);
 
         return .{
             .pattern = pattern,
             .nfa = nfa,
             .is_literal = lit != null,
             .literal_str = lit orelse "",
+            .required_literal = req_lit,
+            .allocator = allocator,
+            .byte_classes = byte_classes,
+            .num_classes = num_classes,
         };
     }
 
     pub fn deinit(self: *Regex, allocator: std.mem.Allocator) void {
         self.nfa.deinit(allocator);
+        if (self.required_literal) |lit| {
+            allocator.free(lit);
+        }
     }
 
     /// Check if pattern matches anywhere in text.
-    pub fn isMatch(self: *const Regex, text: []const u8, allocator: std.mem.Allocator) !bool {
+    /// For thread-safe cached matching, use isMatchDfa() with a per-thread LazyDfa.
+    pub fn isMatch(self: *const Regex, text: []const u8) !bool {
         // Fast path: pure literal patterns use direct search
         if (self.is_literal) {
             return std.mem.indexOf(u8, text, self.literal_str) != null;
         }
 
-        const executor = NfaExecutor.init(&self.nfa);
-        return executor.isMatch(text, allocator);
+        const num_states = self.nfa.states.len;
+        if (num_states == 0) return false;
+
+        // Optimization 1: If we have a required literal, use SIMD to find candidates first
+        if (self.required_literal) |literal| {
+            if (std.mem.indexOf(u8, text, literal) == null) {
+                return false; // Literal not found, pattern can't match
+            }
+        }
+
+        return self.isMatchNfa(text, self.allocator);
+    }
+
+    /// Check if pattern matches using a lazy DFA cache for acceleration.
+    /// The DFA caches NFA state-set transitions so repeated state configurations
+    /// (common in text search) skip NFA simulation entirely.
+    /// The caller owns the LazyDfa and can reuse it across multiple isMatchDfa calls
+    /// (e.g., across all lines in a file). This is the primary optimization for grep.
+    pub fn isMatchDfa(self: *const Regex, text: []const u8, dfa: *lazy_dfa_mod.LazyDfa) !bool {
+        // Fast path: pure literal patterns use direct search
+        if (self.is_literal) {
+            return std.mem.indexOf(u8, text, self.literal_str) != null;
+        }
+
+        const num_states = self.nfa.states.len;
+        if (num_states == 0) return false;
+
+        // Optimization 1: If we have a required literal, use SIMD to find candidates first
+        if (self.required_literal) |literal| {
+            if (std.mem.indexOf(u8, text, literal) == null) {
+                return false;
+            }
+        }
+
+        return dfa.isMatch(text);
+    }
+
+    /// Create a lazy DFA instance for this regex. Caller owns and must deinit.
+    /// Use with isMatchDfa() for cached matching across multiple texts.
+    pub fn createDfa(self: *const Regex, allocator: std.mem.Allocator) !lazy_dfa_mod.LazyDfa {
+        return lazy_dfa_mod.LazyDfa.init(allocator, &self.nfa, &self.byte_classes, self.num_classes);
+    }
+
+    /// Plain NFA simulation (baseline, no caching).
+    fn isMatchNfa(self: *const Regex, text: []const u8, allocator: std.mem.Allocator) !bool {
+        const num_states = self.nfa.states.len;
+        if (num_states == 0) return false;
+
+        const set_size = (num_states + 63) / 64;
+        var current_buf = try allocator.alloc(u64, set_size);
+        defer allocator.free(current_buf);
+        var next_buf = try allocator.alloc(u64, set_size);
+        defer allocator.free(next_buf);
+
+        @memset(current_buf, 0);
+        addStateNoAlloc(current_buf, &self.nfa, self.nfa.start, text, 0);
+
+        for (0..num_states) |si| {
+            if (getBit(current_buf, @intCast(si))) {
+                if (self.nfa.states[si].kind == .accept) {
+                    return true;
+                }
+            }
+        }
+
+        for (0..text.len) |pos| {
+            @memset(next_buf, 0);
+            const ch = text[pos];
+
+            for (0..num_states) |si| {
+                if (!getBit(current_buf, @intCast(si))) continue;
+
+                const state = &self.nfa.states[si];
+                switch (state.kind) {
+                    .match_char => {
+                        if (ch == state.char) {
+                            addStateNoAlloc(next_buf, &self.nfa, state.out1, text, pos + 1);
+                        }
+                    },
+                    .match_any => {
+                        if (ch != '\n') {
+                            addStateNoAlloc(next_buf, &self.nfa, state.out1, text, pos + 1);
+                        }
+                    },
+                    .match_class => {
+                        const matches = if (state.class_lut) |lut| lut[ch] else matchCharClass(ch, state.ranges, state.negated);
+                        if (matches) {
+                            addStateNoAlloc(next_buf, &self.nfa, state.out1, text, pos + 1);
+                        }
+                    },
+                    .split, .accept, .anchor_start, .anchor_end, .word_boundary => {},
+                }
+            }
+
+            addStateNoAlloc(next_buf, &self.nfa, self.nfa.start, text, pos + 1);
+
+            const tmp = current_buf;
+            current_buf = next_buf;
+            next_buf = tmp;
+
+            for (0..num_states) |si| {
+                if (getBit(current_buf, @intCast(si))) {
+                    if (self.nfa.states[si].kind == .accept) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
     }
 
     /// Check if this is a pure literal pattern (for SIMD dispatch).
@@ -1073,6 +1315,99 @@ fn extractPureLiteral(pattern: []const u8) ?[]const u8 {
     return if (pattern.len > 0) pattern else null;
 }
 
+/// Compute byte equivalence classes for DFA optimization.
+/// Two bytes are equivalent if they behave identically across all NFA states.
+/// This reduces the DFA transition table from 256 entries to num_classes entries.
+fn computeByteClasses(nfa: *const Nfa, byte_classes: *[256]u8, num_classes: *u16) void {
+    // Initialize all bytes in class 0
+    for (0..256) |i| {
+        byte_classes[i] = 0;
+    }
+    var next_class: u8 = 1;
+
+    // For each NFA state, refine the classes based on its matching behavior
+    for (nfa.states) |state| {
+        switch (state.kind) {
+            .match_char => {
+                // Split class containing state.char into its own class
+                const char_byte = state.char;
+                const old_class = byte_classes[char_byte];
+                for (0..256) |i| {
+                    if (i == char_byte and byte_classes[i] == old_class) {
+                        byte_classes[i] = next_class;
+                    }
+                }
+                next_class += 1;
+            },
+            .match_class => {
+                // Split classes at range boundaries using the LUT (from opt #1)
+                if (state.class_lut) |lut| {
+                    // Refine classes based on the LUT values
+                    var split_map: [256]u8 = undefined;
+                    @memset(&split_map, 0);
+                    var num_splits: u8 = 1;
+
+                    for (0..256) |i| {
+                        const byte_idx: u8 = @intCast(i);
+                        const old_class = byte_classes[byte_idx];
+                        const in_class = lut[i];
+
+                        // Create new class for bytes in this class with different membership
+                        var found_split = false;
+                        for (0..num_splits) |s| {
+                            const split_idx: u8 = @intCast(s);
+                            if (split_map[split_idx] == old_class) {
+                                // Check if this split has consistent membership
+                                if ((split_map[split_idx + 1] & 1) == (if (in_class) @as(u8, 1) else 0)) {
+                                    found_split = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (!found_split and num_splits < 255) {
+                            split_map[num_splits] = old_class;
+                            split_map[num_splits + 1] = if (in_class) 1 else 0;
+                            num_splits += 1;
+                        }
+                    }
+
+                    // Assign new classes based on splits
+                    for (0..256) |i| {
+                        const byte_idx: u8 = @intCast(i);
+                        const old_class = byte_classes[byte_idx];
+                        const in_class = lut[i];
+
+                        for (0..num_splits) |s| {
+                            const split_idx: u8 = @intCast(s);
+                            if (split_map[split_idx] == old_class and
+                                (split_map[split_idx + 1] & 1) == (if (in_class) @as(u8, 1) else 0)) {
+                                byte_classes[i] = split_idx + 1;
+                                break;
+                            }
+                        }
+                    }
+
+                    next_class = @intCast(@as(u16, num_splits) + 1);
+                }
+            },
+            .match_any => {
+                // Split '\n' into its own class
+                const newline_class = byte_classes['\n'];
+                for (0..256) |i| {
+                    if (i == '\n' and byte_classes[i] == newline_class) {
+                        byte_classes[i] = next_class;
+                    }
+                }
+                next_class += 1;
+            },
+            else => {},
+        }
+    }
+
+    num_classes.* = next_class;
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 test "tokenizer basic" {
@@ -1099,124 +1434,124 @@ test "parse and compile simple literal" {
     defer re.deinit(std.testing.allocator);
 
     try std.testing.expect(re.is_literal);
-    try std.testing.expect(try re.isMatch("xabcy", std.testing.allocator));
-    try std.testing.expect(!try re.isMatch("xaby", std.testing.allocator));
+    try std.testing.expect(try re.isMatch("xabcy"));
+    try std.testing.expect(!try re.isMatch("xaby"));
 }
 
 test "regex dot matches any" {
     var re = try Regex.compile(std.testing.allocator, "a.c");
     defer re.deinit(std.testing.allocator);
 
-    try std.testing.expect(try re.isMatch("abc", std.testing.allocator));
-    try std.testing.expect(try re.isMatch("axc", std.testing.allocator));
-    try std.testing.expect(!try re.isMatch("ac", std.testing.allocator));
+    try std.testing.expect(try re.isMatch("abc"));
+    try std.testing.expect(try re.isMatch("axc"));
+    try std.testing.expect(!try re.isMatch("ac"));
 }
 
 test "regex star quantifier" {
     var re = try Regex.compile(std.testing.allocator, "ab*c");
     defer re.deinit(std.testing.allocator);
 
-    try std.testing.expect(try re.isMatch("ac", std.testing.allocator));
-    try std.testing.expect(try re.isMatch("abc", std.testing.allocator));
-    try std.testing.expect(try re.isMatch("abbbc", std.testing.allocator));
-    try std.testing.expect(!try re.isMatch("adc", std.testing.allocator));
+    try std.testing.expect(try re.isMatch("ac"));
+    try std.testing.expect(try re.isMatch("abc"));
+    try std.testing.expect(try re.isMatch("abbbc"));
+    try std.testing.expect(!try re.isMatch("adc"));
 }
 
 test "regex plus quantifier" {
     var re = try Regex.compile(std.testing.allocator, "ab+c");
     defer re.deinit(std.testing.allocator);
 
-    try std.testing.expect(!try re.isMatch("ac", std.testing.allocator));
-    try std.testing.expect(try re.isMatch("abc", std.testing.allocator));
-    try std.testing.expect(try re.isMatch("abbbc", std.testing.allocator));
+    try std.testing.expect(!try re.isMatch("ac"));
+    try std.testing.expect(try re.isMatch("abc"));
+    try std.testing.expect(try re.isMatch("abbbc"));
 }
 
 test "regex alternation" {
     var re = try Regex.compile(std.testing.allocator, "cat|dog");
     defer re.deinit(std.testing.allocator);
 
-    try std.testing.expect(try re.isMatch("I have a cat", std.testing.allocator));
-    try std.testing.expect(try re.isMatch("I have a dog", std.testing.allocator));
-    try std.testing.expect(!try re.isMatch("I have a bird", std.testing.allocator));
+    try std.testing.expect(try re.isMatch("I have a cat"));
+    try std.testing.expect(try re.isMatch("I have a dog"));
+    try std.testing.expect(!try re.isMatch("I have a bird"));
 }
 
 test "regex character class" {
     var re = try Regex.compile(std.testing.allocator, "[aeiou]+");
     defer re.deinit(std.testing.allocator);
 
-    try std.testing.expect(try re.isMatch("hello", std.testing.allocator));
-    try std.testing.expect(!try re.isMatch("xyz", std.testing.allocator));
+    try std.testing.expect(try re.isMatch("hello"));
+    try std.testing.expect(!try re.isMatch("xyz"));
 }
 
 test "regex character range" {
     var re = try Regex.compile(std.testing.allocator, "[a-z]+");
     defer re.deinit(std.testing.allocator);
 
-    try std.testing.expect(try re.isMatch("hello", std.testing.allocator));
-    try std.testing.expect(!try re.isMatch("12345", std.testing.allocator));
+    try std.testing.expect(try re.isMatch("hello"));
+    try std.testing.expect(!try re.isMatch("12345"));
 }
 
 test "regex negated class" {
     var re = try Regex.compile(std.testing.allocator, "[^0-9]+");
     defer re.deinit(std.testing.allocator);
 
-    try std.testing.expect(try re.isMatch("hello", std.testing.allocator));
+    try std.testing.expect(try re.isMatch("hello"));
     // "12345" — the [^0-9]+ requires at least one non-digit
-    try std.testing.expect(!try re.isMatch("12345", std.testing.allocator));
+    try std.testing.expect(!try re.isMatch("12345"));
 }
 
 test "regex shorthand classes" {
     var re_d = try Regex.compile(std.testing.allocator, "\\d+");
     defer re_d.deinit(std.testing.allocator);
-    try std.testing.expect(try re_d.isMatch("abc123", std.testing.allocator));
+    try std.testing.expect(try re_d.isMatch("abc123"));
 
     var re_w = try Regex.compile(std.testing.allocator, "\\w+");
     defer re_w.deinit(std.testing.allocator);
-    try std.testing.expect(try re_w.isMatch("hello_world", std.testing.allocator));
+    try std.testing.expect(try re_w.isMatch("hello_world"));
 
     var re_s = try Regex.compile(std.testing.allocator, "\\s+");
     defer re_s.deinit(std.testing.allocator);
-    try std.testing.expect(try re_s.isMatch("hello world", std.testing.allocator));
+    try std.testing.expect(try re_s.isMatch("hello world"));
 }
 
 test "regex anchors" {
     var re_start = try Regex.compile(std.testing.allocator, "^hello");
     defer re_start.deinit(std.testing.allocator);
-    try std.testing.expect(try re_start.isMatch("hello world", std.testing.allocator));
-    try std.testing.expect(!try re_start.isMatch("say hello", std.testing.allocator));
+    try std.testing.expect(try re_start.isMatch("hello world"));
+    try std.testing.expect(!try re_start.isMatch("say hello"));
 
     var re_end = try Regex.compile(std.testing.allocator, "world$");
     defer re_end.deinit(std.testing.allocator);
-    try std.testing.expect(try re_end.isMatch("hello world", std.testing.allocator));
-    try std.testing.expect(!try re_end.isMatch("world hello", std.testing.allocator));
+    try std.testing.expect(try re_end.isMatch("hello world"));
+    try std.testing.expect(!try re_end.isMatch("world hello"));
 }
 
 test "regex question mark" {
     var re = try Regex.compile(std.testing.allocator, "colou?r");
     defer re.deinit(std.testing.allocator);
 
-    try std.testing.expect(try re.isMatch("color", std.testing.allocator));
-    try std.testing.expect(try re.isMatch("colour", std.testing.allocator));
+    try std.testing.expect(try re.isMatch("color"));
+    try std.testing.expect(try re.isMatch("colour"));
 }
 
 test "regex repetition {n,m}" {
     var re = try Regex.compile(std.testing.allocator, "a{2,4}");
     defer re.deinit(std.testing.allocator);
 
-    try std.testing.expect(!try re.isMatch("a", std.testing.allocator));
-    try std.testing.expect(try re.isMatch("aa", std.testing.allocator));
-    try std.testing.expect(try re.isMatch("aaa", std.testing.allocator));
-    try std.testing.expect(try re.isMatch("aaaa", std.testing.allocator));
-    try std.testing.expect(try re.isMatch("aaaaa", std.testing.allocator)); // matches first 4
+    try std.testing.expect(!try re.isMatch("a"));
+    try std.testing.expect(try re.isMatch("aa"));
+    try std.testing.expect(try re.isMatch("aaa"));
+    try std.testing.expect(try re.isMatch("aaaa"));
+    try std.testing.expect(try re.isMatch("aaaaa")); // matches first 4
 }
 
 test "regex practical: function signature" {
     var re = try Regex.compile(std.testing.allocator, "fn\\s+\\w+\\(");
     defer re.deinit(std.testing.allocator);
 
-    try std.testing.expect(try re.isMatch("pub fn init(allocator: Allocator) void {", std.testing.allocator));
-    try std.testing.expect(try re.isMatch("fn main() !void {", std.testing.allocator));
-    try std.testing.expect(!try re.isMatch("const fn_name = 42;", std.testing.allocator));
+    try std.testing.expect(try re.isMatch("pub fn init(allocator: Allocator) void {"));
+    try std.testing.expect(try re.isMatch("fn main() !void {"));
+    try std.testing.expect(!try re.isMatch("const fn_name = 42;"));
 }
 
 test "regex practical: import statement" {
@@ -1224,9 +1559,9 @@ test "regex practical: import statement" {
     var re = try Regex.compile(std.testing.allocator, "import\\s+\\w+");
     defer re.deinit(std.testing.allocator);
 
-    try std.testing.expect(try re.isMatch("import std", std.testing.allocator));
-    try std.testing.expect(try re.isMatch("from os import path", std.testing.allocator));
-    try std.testing.expect(!try re.isMatch("no imports here", std.testing.allocator));
+    try std.testing.expect(try re.isMatch("import std"));
+    try std.testing.expect(try re.isMatch("from os import path"));
+    try std.testing.expect(!try re.isMatch("no imports here"));
 }
 
 test "pure literal detection" {

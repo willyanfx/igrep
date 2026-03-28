@@ -74,6 +74,7 @@ test {
     _ = @import("searcher.zig");
     _ = @import("engine/literal.zig");
     _ = @import("engine/regex.zig");
+    _ = @import("engine/lazy_dfa.zig");
     _ = @import("io/mmap.zig");
     _ = @import("io/walker.zig");
     _ = @import("io/gitignore.zig");

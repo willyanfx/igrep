@@ -2,6 +2,7 @@ const std = @import("std");
 const cli = @import("cli.zig");
 const literal = @import("engine/literal.zig");
 const regex_engine = @import("engine/regex.zig");
+const lazy_dfa_mod = @import("engine/lazy_dfa.zig");
 const simd_utils = @import("util/simd.zig");
 const mmap = @import("io/mmap.zig");
 const walker = @import("io/walker.zig");
@@ -129,13 +130,47 @@ pub const Searcher = struct {
             try self.runParallel(file_list.items);
         } else {
             // Single-threaded: write directly to stdout, no buffers needed
+            // Prefetch lookahead for next files
             var direct_printer = output_printer.Printer.init(
                 self.stdout_writer,
                 self.use_color,
                 self.config.line_number,
             );
-            for (file_list.items) |file_path| {
-                self.searchFile(file_path, &direct_printer);
+            var lookahead: [2]?mmap.MappedFile = .{ null, null };
+            defer {
+                if (lookahead[0]) |*f| f.close();
+                if (lookahead[1]) |*f| f.close();
+            }
+
+            // Create one DFA for all files in single-threaded mode
+            var shared_dfa: ?lazy_dfa_mod.LazyDfa = null;
+            if (!self.use_literal_path) {
+                if (self.compiled_regex) |*re| {
+                    if (re.createDfa(self.allocator)) |dfa| {
+                        shared_dfa = dfa;
+                    } else |_| {}
+                }
+            }
+            defer if (shared_dfa) |*dfa| dfa.deinit();
+
+            for (file_list.items, 0..) |file_path, idx| {
+                // Refill lookahead: open next files
+                if (lookahead[0]) |*f| f.close();
+                lookahead[0] = lookahead[1];
+                lookahead[1] = null;
+
+                if (idx + 1 < file_list.items.len) {
+                    lookahead[0] = mmap.MappedFile.prefetchPath(file_list.items[idx + 1]) catch null;
+                }
+                if (idx + 2 < file_list.items.len) {
+                    lookahead[1] = mmap.MappedFile.prefetchPath(file_list.items[idx + 2]) catch null;
+                }
+
+                if (shared_dfa) |*dfa| {
+                    self.searchFile(file_path, &direct_printer, dfa);
+                } else {
+                    self.searchFile(file_path, &direct_printer, null);
+                }
             }
             direct_printer.flush();
         }
@@ -198,8 +233,24 @@ pub const Searcher = struct {
                 self.use_color,
                 self.config.line_number,
             );
+
+            // Create one DFA for all files in single-threaded mode
+            var shared_dfa: ?lazy_dfa_mod.LazyDfa = null;
+            if (!self.use_literal_path) {
+                if (self.compiled_regex) |*re| {
+                    if (re.createDfa(self.allocator)) |dfa| {
+                        shared_dfa = dfa;
+                    } else |_| {}
+                }
+            }
+            defer if (shared_dfa) |*dfa| dfa.deinit();
+
             for (candidates.items) |file_path| {
-                self.searchFile(file_path, &direct_printer);
+                if (shared_dfa) |*dfa| {
+                    self.searchFile(file_path, &direct_printer, dfa);
+                } else {
+                    self.searchFile(file_path, &direct_printer, null);
+                }
             }
             direct_printer.flush();
         }
@@ -264,11 +315,14 @@ pub const Searcher = struct {
 
     /// Worker function executed on thread pool threads.
     /// Each worker gets its own OutputBuffer — no lock during search/format.
+    /// Note: Due to thread pool architecture (per-file spawning), each file still
+    /// gets its own DFA. For true per-worker DFA reuse, the thread pool would need
+    /// restructuring. The LUT optimization (#1) provides the main perf gains here.
     fn workerSearchFile(self: *Searcher, file_path: []const u8, wg: *std.Thread.WaitGroup) void {
         defer wg.finish();
 
-        // Thread-local output buffer — formatted output goes here lock-free
-        var out_buf = output_buffer.OutputBuffer.init();
+        // Thread-local output buffer with 4KB initial capacity — avoids early reallocs
+        var out_buf = output_buffer.OutputBuffer.initWithCapacity(self.allocator, 4096) catch output_buffer.OutputBuffer.init();
         defer out_buf.deinit(self.allocator);
 
         var buf_writer = output_buffer.BufferWriter.init(&out_buf, self.allocator);
@@ -278,7 +332,8 @@ pub const Searcher = struct {
             self.config.line_number,
         );
 
-        self.searchFile(file_path, &printer);
+        // Pass null for optional_dfa; each worker gets per-file DFAs
+        self.searchFile(file_path, &printer, null);
 
         // Only take the lock to flush the completed buffer to stdout
         if (!out_buf.isEmpty()) {
@@ -291,7 +346,9 @@ pub const Searcher = struct {
     /// Search a single file and write results to the provided printer.
     /// This function is lock-free — the printer writes to whatever backend
     /// it was initialized with (buffer for parallel, stdout for single-threaded).
-    fn searchFile(self: *Searcher, file_path: []const u8, printer: *output_printer.Printer) void {
+    /// If dfa is provided, it will be reused across files (caller manages lifetime).
+    /// If dfa is null, a per-file DFA is created and destroyed.
+    fn searchFile(self: *Searcher, file_path: []const u8, printer: *output_printer.Printer, optional_dfa: ?*lazy_dfa_mod.LazyDfa) void {
         var mapped = mmap.MappedFile.open(file_path) catch |err| {
             switch (err) {
                 error.IsDir => return,
@@ -309,6 +366,32 @@ pub const Searcher = struct {
 
         // Quick binary file detection: check first 512 bytes for null bytes
         if (isBinary(contents)) return;
+
+        // Initialize per-file lazy DFA for cached regex matching.
+        // The DFA persists across all lines in this file, so repeated state
+        // configurations (very common in text) hit the cache instead of
+        // re-simulating the NFA. This is the main regex performance win.
+        var file_dfa: ?lazy_dfa_mod.LazyDfa = null;
+        var owns_dfa = false; // Track if we allocated the DFA
+        defer {
+            if (owns_dfa and file_dfa != null) {
+                file_dfa.?.deinit();
+            }
+        }
+
+        if (optional_dfa != null) {
+            // Reuse the provided DFA (caller manages lifetime)
+            file_dfa = optional_dfa.?.*;
+        } else if (!self.use_literal_path) {
+            if (self.compiled_regex) |*re| {
+                if (re.createDfa(self.allocator)) |dfa| {
+                    file_dfa = dfa;
+                    owns_dfa = true;
+                } else |_| {
+                    file_dfa = null;
+                }
+            }
+        }
 
         // Split contents into lines
         const pattern = self.config.pattern;
@@ -340,9 +423,12 @@ pub const Searcher = struct {
                     else
                         literal.containsCaseInsensitive(line, pattern))
                 else
-                    // Regex NFA path
+                    // Regex path: use lazy DFA if available, fall back to NFA
                     (if (self.compiled_regex) |*re|
-                        (re.isMatch(line, self.allocator) catch false)
+                        (if (file_dfa) |*dfa|
+                            (re.isMatchDfa(line, dfa) catch re.isMatch(line) catch false)
+                        else
+                            (re.isMatch(line) catch false))
                     else
                         false);
 

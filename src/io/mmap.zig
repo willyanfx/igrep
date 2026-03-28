@@ -47,6 +47,22 @@ pub const MappedFile = struct {
         return &.{};
     }
 
+    /// Prefetch pages using MADV_WILLNEED to bring them into memory.
+    /// This overlaps page fault handling with userspace search in the current file.
+    pub fn prefetch(self: *const MappedFile) void {
+        if (self.ptr) |p| {
+            std.posix.madvise(p, self.len, std.posix.MADV.WILLNEED) catch {};
+        }
+    }
+
+    /// Open, mmap, and prefetch a file for later use.
+    /// Returns a MappedFile ready for searching. Caller must close() it.
+    pub fn prefetchPath(path: []const u8) !MappedFile {
+        var mapped = try open(path);
+        mapped.prefetch();
+        return mapped;
+    }
+
     /// Unmap the file and close the file descriptor.
     pub fn close(self: *MappedFile) void {
         if (self.ptr) |p| {

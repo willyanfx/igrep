@@ -170,12 +170,26 @@ pub fn findAll(
 /// Scans for positions where the first and last bytes of the needle
 /// match simultaneously, with an optional middle byte check to reduce
 /// false positives for longer patterns. Then verifies full match at candidates.
+/// Uses adaptive SIMD width for better performance on modern CPUs.
 fn simdFindFirstLastPair(
     haystack: []const u8,
     needle: []const u8,
     first_byte: u8,
     last_byte: u8,
 ) ?usize {
+    const search_end = haystack.len - needle.len + 1;
+
+    // Try wide vector path first if available and data is large enough
+    if (simd_utils.VECTOR_LEN == 16 and
+        simd_utils.WIDE_VECTOR_LEN == 32 and
+        search_end >= simd_utils.WIDE_VECTOR_LEN)
+    {
+        if (simdFindFirstLastPairWide(haystack, needle, first_byte, last_byte)) |pos| {
+            return pos;
+        }
+    }
+
+    // Standard narrow path
     const Vec = @Vector(simd_utils.VECTOR_LEN, u8);
     const first_vec: Vec = @splat(first_byte);
     const last_vec: Vec = @splat(last_byte);
@@ -185,7 +199,6 @@ fn simdFindFirstLastPair(
     const mid_offset = needle.len / 2;
     const mid_vec: Vec = if (use_mid) @splat(needle[mid_offset]) else @splat(@as(u8, 0));
 
-    const search_end = haystack.len - needle.len + 1;
     var i: usize = 0;
 
     while (i + simd_utils.VECTOR_LEN <= search_end) {
@@ -232,6 +245,61 @@ fn simdFindFirstLastPair(
         }
     }
 
+    return null;
+}
+
+/// Wide vector variant of simdFindFirstLastPair using 32-byte scans.
+/// Returns null if no match found (falls through to narrow path).
+fn simdFindFirstLastPairWide(
+    haystack: []const u8,
+    needle: []const u8,
+    first_byte: u8,
+    last_byte: u8,
+) ?usize {
+    const WideVec = @Vector(simd_utils.WIDE_VECTOR_LEN, u8);
+    const first_vec: WideVec = @splat(first_byte);
+    const last_vec: WideVec = @splat(last_byte);
+
+    const use_mid = needle.len >= 4;
+    const mid_offset = needle.len / 2;
+    const mid_vec: WideVec = if (use_mid) @splat(needle[mid_offset]) else @splat(@as(u8, 0));
+
+    const search_end = haystack.len - needle.len + 1;
+    var i: usize = 0;
+
+    while (i + simd_utils.WIDE_VECTOR_LEN <= search_end) {
+        const first_chunk: WideVec = haystack[i..][0..simd_utils.WIDE_VECTOR_LEN].*;
+        const last_chunk: WideVec = haystack[i + needle.len - 1 ..][0..simd_utils.WIDE_VECTOR_LEN].*;
+
+        const first_match: @Vector(simd_utils.WIDE_VECTOR_LEN, bool) = first_chunk == first_vec;
+        const last_match: @Vector(simd_utils.WIDE_VECTOR_LEN, bool) = last_chunk == last_vec;
+
+        var mask: u32 = @as(u32, @bitCast(first_match)) & @as(u32, @bitCast(last_match));
+
+        if (use_mid and mask != 0) {
+            const mid_chunk: WideVec = haystack[i + mid_offset ..][0..simd_utils.WIDE_VECTOR_LEN].*;
+            const mid_match: @Vector(simd_utils.WIDE_VECTOR_LEN, bool) = mid_chunk == mid_vec;
+            mask &= @as(u32, @bitCast(mid_match));
+        }
+
+        while (mask != 0) {
+            const bit_pos = @ctz(mask);
+            const candidate = i + bit_pos;
+
+            if (candidate + needle.len <= haystack.len and
+                std.mem.eql(u8, haystack[candidate..][0..needle.len], needle))
+            {
+                return candidate;
+            }
+
+            mask &= mask - 1;
+        }
+
+        i += simd_utils.WIDE_VECTOR_LEN;
+    }
+
+    // When wide loop ends but narrow path hasn't been tried yet, return null
+    // to allow narrow path to continue from where wide left off.
     return null;
 }
 

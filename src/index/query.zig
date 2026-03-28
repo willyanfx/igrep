@@ -18,9 +18,13 @@ pub const QueryResult = struct {
 ///
 /// Algorithm:
 ///   1. Extract all trigrams from the literal part of the pattern.
-///   2. For each trigram, get the posting list from the index.
-///   3. Intersect all posting lists (a file must appear in ALL lists).
-///   4. Optionally apply bloom filter masks for extra filtering.
+///   2. Select the K rarest trigrams (best for filtering).
+///   3. For each selected trigram, get the posting list from the index.
+///   4. Intersect selected posting lists (a file must appear in ALL lists).
+///   5. Optionally apply bloom filter masks for extra filtering.
+///
+/// This is more efficient than intersecting all trigrams when patterns are long,
+/// since rare trigrams produce smaller posting lists.
 ///
 /// Returns file IDs that are candidates — these must still be verified
 /// by actually searching the file contents.
@@ -42,8 +46,14 @@ pub fn queryCandidates(
         return allFiles(index, allocator);
     }
 
-    // Find the posting list for the first trigram
-    const first_postings = index.postings.get(pattern_trigrams[0]) orelse {
+    // Select the K rarest (most selective) trigrams
+    // K=3 is usually sufficient for high selectivity while reducing intersection work
+    const k_best = @min(@as(usize, 4), pattern_trigrams.len);
+    const best_trigrams = try trigram.selectBestTrigrams(pattern_trigrams, k_best, allocator);
+    defer if (best_trigrams.len > 0) allocator.free(best_trigrams);
+
+    // Find the posting list for the first best trigram
+    const first_postings = index.postings.get(best_trigrams[0]) orelse {
         // Trigram not in index — no files can match
         return .{ .file_ids = &.{}, .allocator = allocator };
     };
@@ -56,8 +66,8 @@ pub fn queryCandidates(
         try candidates.put(entry.file_id, {});
     }
 
-    // Intersect with remaining trigram posting lists
-    for (pattern_trigrams[1..]) |tri_hash| {
+    // Intersect with remaining best trigram posting lists
+    for (best_trigrams[1..]) |tri_hash| {
         const postings = index.postings.get(tri_hash) orelse {
             // This trigram doesn't exist in any file — no matches possible
             return .{ .file_ids = &.{}, .allocator = allocator };
