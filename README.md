@@ -1,20 +1,29 @@
 # igrep
 
-A blazing-fast code search tool built in Zig, inspired by [Cursor's instant grep](https://www.cursor.com/). Matches or beats ripgrep on common patterns through SIMD-accelerated literal matching, a lazy DFA regex engine, trigram indexing, and parallel file processing.
+A blazing-fast code search tool built in Zig, inspired by [Cursor's instant grep](https://www.cursor.com/). Matches or beats ripgrep on common patterns through SIMD-accelerated literal matching, a lazy DFA regex engine, trigram indexing with regex-aware query decomposition, and parallel file processing.
 
-## Performance (52MB, aarch64 Linux)
+## Performance vs ripgrep (2,002 files, 15 MB corpus, aarch64 Linux)
+
+### Indexed search — where igrep wins
+
+| Pattern | rg | igrep --index | Speedup |
+|---------|---:|-------------:|--------:|
+| `TypeError` (literal, 0 matches) | 1,025 ms | **14 ms** | **73×** |
+| `NONEXISTENT_XYZ` (literal, 0 matches) | 1,047 ms | **16 ms** | **65×** |
+| `function` (literal, 1701 matches) | 1,072 ms | **231 ms** | **4.6×** |
+| `TypeError.*found` (regex, 0 matches) | 956 ms | **13 ms** | **73×** |
+| `\berror\b` (regex, 3961 matches) | 867 ms | **180 ms** | **4.8×** |
+| `function\s+\w+\(` (regex, 1701 matches) | 970 ms | **201 ms** | **4.8×** |
+| `import\s+\{` (regex, 1701 matches) | 968 ms | **688 ms** | **1.4×** |
+
+### Large file performance
 
 | Pattern | igrep | ripgrep | Result |
 |---------|------:|--------:|--------|
-| `fn\s+\w+\(` (dense regex) | 16 ms | 16 ms | Tied |
-| `fn\s+\w+\(` (rare regex) | 0 ms | 10 ms | Faster than rg |
-| `[a-zA-Z0-9_]+` (dense) | 69 ms | 91 ms | 1.3× faster |
-| `-F fn` (literal) | 31 ms | 15 ms | ~2× slower |
-| `\d+\.\d+` (no literal prefix) | 56 ms | 58 ms | Tied |
-| `bravo charlie` (65MB, common) | 34 ms | 79 ms | 2.3× faster |
-| `critical` (12MB, rare) | 4 ms | 8 ms | 2× faster |
+| `bravo charlie` (65MB, common) | 34 ms | 79 ms | **2.3× faster** |
+| `critical` (12MB, rare) | 4 ms | 8 ms | **2× faster** |
 
-Indexed search (`--index`) adds another 4–68× speedup on zero-match and rare-match patterns.
+Indexed regex search works by decomposing the regex AST into literal fragments, querying their trigrams against the index, and running the NFA only on candidate files.
 
 ## How it works
 
@@ -33,6 +42,7 @@ Key techniques:
 - **Lazy DFA with epsilon closure caching** — caches NFA state-set transitions so repeated configurations (common in text) skip NFA simulation entirely
 - **Byte equivalence classes** — groups bytes that behave identically in the regex, reducing DFA state space
 - **Trigram index** with bloom-augmented posting lists for codebase-scale search
+- **Regex-to-trigram query decomposition** — walks the regex AST to extract literal fragments, builds AND/OR query plans, and narrows candidate files before running the NFA engine
 - **Parallel directory walker** with `.gitignore` awareness and file type filtering
 
 ## Build
@@ -68,6 +78,9 @@ igrep -c "FIXME" .
 
 # Indexed search (auto-builds on first use)
 igrep --index "TypeError" .
+
+# Indexed regex search (extracts literal fragments from regex)
+igrep --index -e 'function\s+\w+\(' .
 
 # Build/rebuild index
 igrep --index-build .
@@ -115,6 +128,7 @@ src/
 │   ├── builder.zig       Parallel index construction
 │   ├── store.zig         Binary index format (mmap'd lookup)
 │   ├── query.zig         Trigram query with posting list intersection
+│   ├── query_decompose.zig  Regex AST → trigram query plan (AND/OR decomposition)
 │   └── cache.zig         Index staleness detection
 ├── io/
 │   ├── mmap.zig          Memory-mapped file I/O with madvise hints

@@ -83,6 +83,7 @@ test {
     _ = @import("index/builder.zig");
     _ = @import("index/store.zig");
     _ = @import("index/query.zig");
+    _ = @import("index/query_decompose.zig");
     _ = @import("index/cache.zig");
     _ = @import("util/pool.zig");
     _ = @import("util/simd.zig");

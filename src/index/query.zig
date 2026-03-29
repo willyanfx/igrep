@@ -2,6 +2,7 @@ const std = @import("std");
 const trigram = @import("../engine/trigram.zig");
 const bloom = @import("../engine/bloom.zig");
 const builder = @import("builder.zig");
+const query_decompose = @import("query_decompose.zig");
 
 /// Query result: list of candidate file IDs that might contain the pattern.
 pub const QueryResult = struct {
@@ -166,6 +167,203 @@ fn allFiles(index: *const builder.TrigramIndex, allocator: std.mem.Allocator) !Q
         result[i] = @intCast(i);
     }
     return .{ .file_ids = result, .allocator = allocator };
+}
+
+/// Query the trigram index using a decomposed regex QueryPlan.
+///
+/// This enables indexed search for regex patterns by extracting literal
+/// fragments from the regex AST and querying their trigrams.
+/// Falls back to allFiles if the plan is not selective.
+pub fn queryCandidatesFromPlan(
+    index: *const builder.TrigramIndex,
+    plan: *const query_decompose.QueryPlan,
+    allocator: std.mem.Allocator,
+) !QueryResult {
+    if (!plan.isSelective()) {
+        return allFiles(index, allocator);
+    }
+
+    const file_ids = try executePlan(index, plan, allocator);
+
+    if (file_ids) |ids| {
+        return .{ .file_ids = ids, .allocator = allocator };
+    }
+
+    return allFiles(index, allocator);
+}
+
+/// Execute a QueryPlan recursively, returning a sorted list of candidate file IDs.
+/// Returns null for MatchAll (caller should fall back to allFiles).
+fn executePlan(
+    index: *const builder.TrigramIndex,
+    plan: *const query_decompose.QueryPlan,
+    allocator: std.mem.Allocator,
+) !?[]u32 {
+    switch (plan.*) {
+        .match_all => return null,
+
+        .trigrams => |hashes| {
+            return try intersectTrigramPostings(index, hashes, allocator);
+        },
+
+        .and_plan => |plans| {
+            // Execute each sub-plan and intersect the results
+            var result_set: ?std.AutoHashMap(u32, void) = null;
+            defer if (result_set) |*rs| rs.deinit();
+
+            for (plans) |*sub| {
+                const sub_ids = try executePlan(index, sub, allocator);
+                if (sub_ids == null) continue; // MatchAll sub-plan, skip
+
+                defer allocator.free(sub_ids.?);
+
+                if (result_set == null) {
+                    // First selective sub-plan — seed the result
+                    result_set = std.AutoHashMap(u32, void).init(allocator);
+                    for (sub_ids.?) |id| {
+                        try result_set.?.put(id, {});
+                    }
+                } else {
+                    // Intersect with existing results
+                    var sub_set = std.AutoHashMap(u32, void).init(allocator);
+                    defer sub_set.deinit();
+                    for (sub_ids.?) |id| {
+                        try sub_set.put(id, {});
+                    }
+
+                    var remove_list: std.ArrayList(u32) = .{};
+                    defer if (remove_list.capacity > 0) remove_list.deinit(allocator);
+
+                    var it = result_set.?.keyIterator();
+                    while (it.next()) |key| {
+                        if (!sub_set.contains(key.*)) {
+                            try remove_list.append(allocator, key.*);
+                        }
+                    }
+                    for (remove_list.items) |id| {
+                        _ = result_set.?.remove(id);
+                    }
+                }
+
+                if (result_set != null and result_set.?.count() == 0) {
+                    // Early exit: no candidates left
+                    var rs = result_set.?;
+                    rs.deinit();
+                    result_set = null;
+                    const empty = try allocator.alloc(u32, 0);
+                    return empty;
+                }
+            }
+
+            if (result_set) |*rs| {
+                var result = try allocator.alloc(u32, rs.count());
+                var idx: usize = 0;
+                var it = rs.keyIterator();
+                while (it.next()) |key| {
+                    result[idx] = key.*;
+                    idx += 1;
+                }
+                std.mem.sort(u32, result, {}, std.sort.asc(u32));
+                return result;
+            }
+
+            return null; // All sub-plans were MatchAll
+        },
+
+        .or_plan => |plans| {
+            // Execute each sub-plan and union the results
+            var result_set = std.AutoHashMap(u32, void).init(allocator);
+            defer result_set.deinit();
+
+            for (plans) |*sub| {
+                const sub_ids = try executePlan(index, sub, allocator);
+                if (sub_ids == null) {
+                    // One branch is MatchAll → entire OR is MatchAll
+                    return null;
+                }
+                defer allocator.free(sub_ids.?);
+
+                for (sub_ids.?) |id| {
+                    try result_set.put(id, {});
+                }
+            }
+
+            var result = try allocator.alloc(u32, result_set.count());
+            var idx: usize = 0;
+            var it = result_set.keyIterator();
+            while (it.next()) |key| {
+                result[idx] = key.*;
+                idx += 1;
+            }
+            std.mem.sort(u32, result, {}, std.sort.asc(u32));
+            return result;
+        },
+    }
+}
+
+/// Intersect posting lists for a set of trigram hashes.
+/// Returns sorted file IDs that appear in ALL posting lists.
+fn intersectTrigramPostings(
+    index: *const builder.TrigramIndex,
+    hashes: []const u32,
+    allocator: std.mem.Allocator,
+) ![]u32 {
+    if (hashes.len == 0) {
+        return try allocator.alloc(u32, 0);
+    }
+
+    // Get first posting list
+    const first_postings = index.postings.get(hashes[0]) orelse {
+        return try allocator.alloc(u32, 0);
+    };
+
+    var candidates = std.AutoHashMap(u32, void).init(allocator);
+    defer candidates.deinit();
+
+    for (first_postings) |entry| {
+        try candidates.put(entry.file_id, {});
+    }
+
+    // Intersect with remaining posting lists
+    for (hashes[1..]) |hash| {
+        const postings = index.postings.get(hash) orelse {
+            return try allocator.alloc(u32, 0);
+        };
+
+        var posting_set = std.AutoHashMap(u32, void).init(allocator);
+        defer posting_set.deinit();
+        for (postings) |entry| {
+            try posting_set.put(entry.file_id, {});
+        }
+
+        var remove_list: std.ArrayList(u32) = .{};
+        defer if (remove_list.capacity > 0) remove_list.deinit(allocator);
+
+        var cand_it = candidates.keyIterator();
+        while (cand_it.next()) |key| {
+            if (!posting_set.contains(key.*)) {
+                try remove_list.append(allocator, key.*);
+            }
+        }
+
+        for (remove_list.items) |id| {
+            _ = candidates.remove(id);
+        }
+
+        if (candidates.count() == 0) {
+            return try allocator.alloc(u32, 0);
+        }
+    }
+
+    var result = try allocator.alloc(u32, candidates.count());
+    var idx: usize = 0;
+    var it = candidates.keyIterator();
+    while (it.next()) |key| {
+        result[idx] = key.*;
+        idx += 1;
+    }
+    std.mem.sort(u32, result, {}, std.sort.asc(u32));
+    return result;
 }
 
 // ── Tests ────────────────────────────────────────────────────────────

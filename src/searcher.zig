@@ -12,6 +12,7 @@ const index_builder = @import("index/builder.zig");
 const index_store = @import("index/store.zig");
 const index_query = @import("index/query.zig");
 const index_cache = @import("index/cache.zig");
+const query_decompose = @import("index/query_decompose.zig");
 
 /// High-level search orchestrator.
 /// Coordinates file discovery, pattern matching, and result output.
@@ -96,6 +97,34 @@ pub const Searcher = struct {
             @as(u32, @intCast(idx.postings.count())),
             size / 1024,
         }) catch {};
+    }
+
+    /// Query the index for candidate files. For regex patterns, decomposes
+    /// the regex AST to extract literal fragments for trigram-based filtering.
+    /// Falls back to raw pattern trigrams for literal/fixed-string searches.
+    fn queryIndexCandidates(self: *Searcher, idx: *const index_builder.TrigramIndex) !index_query.QueryResult {
+        if (!self.use_literal_path and self.config.regex_mode) {
+            // Parse pattern into AST and decompose for index query
+            var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+
+            var parser = regex_engine.Parser.init(arena, self.config.pattern);
+            const ast = parser.parse() catch {
+                return index_query.queryCandidates(idx, self.config.pattern, self.allocator);
+            };
+
+            var plan = query_decompose.decompose(ast, self.allocator) catch {
+                return index_query.queryCandidates(idx, self.config.pattern, self.allocator);
+            };
+            defer plan.deinit(self.allocator);
+
+            if (plan.isSelective()) {
+                return index_query.queryCandidatesFromPlan(idx, &plan, self.allocator);
+            }
+        }
+        // Literal mode or non-selective regex — use raw pattern trigrams
+        return index_query.queryCandidates(idx, self.config.pattern, self.allocator);
     }
 
     /// Execute the search across all configured paths.
@@ -198,8 +227,10 @@ pub const Searcher = struct {
         };
         defer idx.deinit();
 
-        // Query for candidate files
-        var result = try index_query.queryCandidates(&idx, self.config.pattern, self.allocator);
+        // Query for candidate files.
+        // For regex mode, decompose the regex AST to extract literal fragments
+        // and query their trigrams. Falls back to raw pattern trigrams for literals.
+        var result = try self.queryIndexCandidates(&idx);
         defer result.deinit();
 
         stderr.print("igrep: index query: {d}/{d} candidate files\n", .{
