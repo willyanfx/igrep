@@ -39,7 +39,7 @@ pub fn containsCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
 
 /// SIMD-accelerated case-insensitive search using first+last byte pair technique.
 /// Folds both haystack bytes to lowercase in the SIMD registers before comparison.
-fn findFirstCaseInsensitive(haystack: []const u8, needle: []const u8) ?usize {
+pub fn findFirstCaseInsensitive(haystack: []const u8, needle: []const u8) ?usize {
     if (needle.len == 0) return 0;
     if (needle.len > haystack.len) return null;
 

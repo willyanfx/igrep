@@ -32,6 +32,10 @@ pub const Searcher = struct {
     /// True if we should use SIMD literal path (pure literal or -F mode).
     use_literal_path: bool = true,
 
+    /// Owned lowercased pattern for case-insensitive regex compilation.
+    /// The compiled regex references this slice, so it must outlive the regex.
+    ci_pattern_buf: ?[]u8 = null,
+
     total_matches: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     /// Mutex only held during the brief stdout write of a completed file buffer.
@@ -48,13 +52,30 @@ pub const Searcher = struct {
 
         var compiled: ?regex_engine.Regex = null;
         var use_literal = true;
+        var ci_pat: ?[]u8 = null;
 
         if (config.regex_mode and !config.fixed_strings) {
+            // For case-insensitive regex, compile from a lowercased pattern.
+            // At match time we also lowercase the input text, so the NFA
+            // transitions (built from lowercase chars) match correctly.
+            const compile_pat = if (!config.case_sensitive) blk: {
+                ci_pat = try allocator.alloc(u8, config.pattern.len);
+                for (config.pattern, 0..) |c, i| {
+                    ci_pat.?[i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+                }
+                break :blk @as([]const u8, ci_pat.?);
+            } else config.pattern;
+
             // Try to compile as regex
-            var re = try regex_engine.Regex.compile(allocator, config.pattern);
+            var re = try regex_engine.Regex.compile(allocator, compile_pat);
             if (re.isPureLiteral()) {
                 // Pattern has no metacharacters — use fast SIMD literal path
+                // (literal path handles case-insensitivity directly)
                 re.deinit(allocator);
+                if (ci_pat) |p| {
+                    allocator.free(p);
+                    ci_pat = null;
+                }
                 use_literal = true;
             } else {
                 compiled = re;
@@ -69,12 +90,16 @@ pub const Searcher = struct {
             .stdout_writer = writer,
             .compiled_regex = compiled,
             .use_literal_path = use_literal,
+            .ci_pattern_buf = ci_pat,
         };
     }
 
     pub fn deinit(self: *Searcher) void {
         if (self.compiled_regex != null) {
             self.compiled_regex.?.deinit(self.allocator);
+        }
+        if (self.ci_pattern_buf) |buf| {
+            self.allocator.free(buf);
         }
         self.stdout_writer.flush() catch {};
     }
@@ -103,6 +128,12 @@ pub const Searcher = struct {
     /// the regex AST to extract literal fragments for trigram-based filtering.
     /// Falls back to raw pattern trigrams for literal/fixed-string searches.
     fn queryIndexCandidates(self: *Searcher, idx: *const index_builder.TrigramIndex) !index_query.QueryResult {
+        // Case-insensitive search: the trigram index is case-sensitive, so we
+        // must return all files as candidates to avoid missing matches.
+        if (!self.config.case_sensitive) {
+            return index_query.queryCandidates(idx, "", self.allocator);
+        }
+
         if (!self.use_literal_path and self.config.regex_mode) {
             // Parse pattern into AST and decompose for index query
             var arena_state = std.heap.ArenaAllocator.init(self.allocator);
@@ -128,9 +159,19 @@ pub const Searcher = struct {
     /// Execute the search across all configured paths.
     /// Returns total number of matching lines.
     pub fn run(self: *Searcher) !u64 {
-        // Indexed search path: use trigram index to find candidates first
+        // Indexed search path: use trigram index to find candidates first.
+        // Index requires a directory root; fall through to standard search
+        // when the root path is a single file.
         if (self.config.use_index) {
-            return try self.runIndexed();
+            const root = if (self.config.paths.len > 0) self.config.paths[0] else ".";
+            const is_dir = blk: {
+                const stat = std.fs.cwd().statFile(root) catch break :blk false;
+                break :blk stat.kind == .directory;
+            };
+            if (is_dir) {
+                return try self.runIndexed();
+            }
+            // Non-directory root: fall through to standard search
         }
 
         // Standard path: collect all files and search
@@ -396,29 +437,46 @@ pub const Searcher = struct {
         // Quick binary file detection: check first 512 bytes for null bytes
         if (isBinary(contents)) return;
 
+        // Case-insensitive regex: lowercase entire file contents once.
+        // Positions map 1:1 (same length), so line boundaries transfer directly.
+        // We match against lowered text but display the original.
+        const ci_regex = !self.config.case_sensitive and !self.use_literal_path;
+        var lower_contents: ?[]u8 = null;
+        defer if (lower_contents) |lc| self.allocator.free(lc);
+
+        const match_contents: []const u8 = if (ci_regex) blk: {
+            lower_contents = self.allocator.alloc(u8, contents.len) catch null;
+            if (lower_contents) |lc| {
+                for (contents, 0..) |c, i| {
+                    lc[i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+                }
+                break :blk lc;
+            }
+            break :blk contents; // allocation failed, fall back to original
+        } else contents;
+
         // Initialize per-file lazy DFA for cached regex matching.
         // The DFA persists across all lines in this file, so repeated state
         // configurations (very common in text) hit the cache instead of
         // re-simulating the NFA. This is the main regex performance win.
-        var file_dfa: ?lazy_dfa_mod.LazyDfa = null;
-        var owns_dfa = false; // Track if we allocated the DFA
-        defer {
-            if (owns_dfa and file_dfa != null) {
-                file_dfa.?.deinit();
-            }
-        }
+        //
+        // Use a pointer to avoid value-copying the DFA struct (which would
+        // break cross-file caching and leak internal allocations).
+        var owned_dfa: lazy_dfa_mod.LazyDfa = undefined;
+        var file_dfa: ?*lazy_dfa_mod.LazyDfa = null;
+        var owns_dfa = false;
+        defer if (owns_dfa) owned_dfa.deinit();
 
-        if (optional_dfa != null) {
-            // Reuse the provided DFA (caller manages lifetime)
-            file_dfa = optional_dfa.?.*;
+        if (optional_dfa) |dfa_ptr| {
+            // Reuse the provided DFA directly (caller manages lifetime)
+            file_dfa = dfa_ptr;
         } else if (!self.use_literal_path) {
             if (self.compiled_regex) |*re| {
                 if (re.createDfa(self.allocator)) |dfa| {
-                    file_dfa = dfa;
+                    owned_dfa = dfa;
                     owns_dfa = true;
-                } else |_| {
-                    file_dfa = null;
-                }
+                    file_dfa = &owned_dfa;
+                } else |_| {}
             }
         }
 
@@ -459,7 +517,9 @@ pub const Searcher = struct {
             var running_line_count_pos: usize = 0;
             var running_line_num: u64 = 1;
 
-            while (literal.findFirst(contents[scan_pos..], req_lit)) |rel_pos| {
+            // Scan match_contents (lowered for CI regex) so the required
+            // literal (also lowered when CI) is found correctly.
+            while (literal.findFirst(match_contents[scan_pos..], req_lit)) |rel_pos| {
                 const lit_pos = scan_pos + rel_pos;
 
                 // Find the line containing this occurrence
@@ -478,6 +538,7 @@ pub const Searcher = struct {
                 // Find line end
                 const cand_line_end = simd_utils.findNextByte(contents, '\n', lit_pos) orelse contents.len;
                 const cand_line = contents[cand_line_start..cand_line_end];
+                const cand_match_line = match_contents[cand_line_start..cand_line_end];
 
                 // Count line number incrementally
                 if (!self.config.count_only or self.config.line_number) {
@@ -488,11 +549,11 @@ pub const Searcher = struct {
                     running_line_count_pos = cand_line_start;
                 }
 
-                // Run DFA on this candidate line
-                const matched = if (file_dfa) |*dfa|
-                    (dfa.isMatch(cand_line) catch re.isMatch(cand_line) catch false)
+                // Run DFA on the (possibly lowered) candidate line
+                const matched = if (file_dfa) |dfa|
+                    (dfa.isMatch(cand_match_line) catch re.isMatch(cand_match_line) catch false)
                 else
-                    (re.isMatch(cand_line) catch false);
+                    (re.isMatch(cand_match_line) catch false);
 
                 if (matched) {
                     file_matches += 1;
@@ -525,20 +586,22 @@ pub const Searcher = struct {
             const line = contents[line_start..line_end];
 
                 const matched = if (self.use_literal_path)
-                    // Fast SIMD literal path
+                    // Fast SIMD literal path (handles CI natively)
                     (if (self.config.case_sensitive)
                         literal.contains(line, pattern)
                     else
                         literal.containsCaseInsensitive(line, pattern))
-                else
-                    // Regex path: use lazy DFA if available, fall back to NFA
-                    (if (self.compiled_regex) |*re|
-                        (if (file_dfa) |*dfa|
-                            (re.isMatchDfa(line, dfa) catch re.isMatch(line) catch false)
+                else blk: {
+                    // Regex path: match against lowered content for CI
+                    const match_line = match_contents[line_start..line_end];
+                    break :blk if (self.compiled_regex) |*re|
+                        (if (file_dfa) |dfa|
+                            (re.isMatchDfa(match_line, dfa) catch re.isMatch(match_line) catch false)
                         else
-                            (re.isMatch(line) catch false))
+                            (re.isMatch(match_line) catch false))
                     else
-                        false);
+                        false;
+                };
 
                 const should_report = if (self.config.invert_match) !matched else matched;
 
