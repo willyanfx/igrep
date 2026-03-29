@@ -81,6 +81,7 @@ fn decomposeNode(node: *const regex.AstNode, allocator: std.mem.Allocator) !Quer
             // Non-literal gaps separate runs.
             var fragments: std.ArrayList(QueryPlan) = .{};
             defer if (fragments.capacity > 0) fragments.deinit(allocator);
+            errdefer for (fragments.items) |*f| @constCast(f).deinit(allocator);
 
             var literal_buf: std.ArrayList(u8) = .{};
             defer if (literal_buf.capacity > 0) literal_buf.deinit(allocator);
@@ -97,14 +98,22 @@ fn decomposeNode(node: *const regex.AstNode, allocator: std.mem.Allocator) !Quer
                     // Flush accumulated literals
                     if (literal_buf.items.len >= trigram.TRIGRAM_SIZE) {
                         const plan = try literalsToTrigrams(literal_buf.items, allocator);
-                        try fragments.append(allocator, plan);
+                        fragments.append(allocator, plan) catch |e| {
+                            var p = plan;
+                            p.deinit(allocator);
+                            return e;
+                        };
                     }
                     literal_buf.items.len = 0;
 
                     // Recurse into non-literal child
                     const child_plan = try decomposeNode(child, allocator);
                     if (child_plan.isSelective()) {
-                        try fragments.append(allocator, child_plan);
+                        fragments.append(allocator, child_plan) catch |e| {
+                            var cp2 = child_plan;
+                            cp2.deinit(allocator);
+                            return e;
+                        };
                     } else {
                         // Discard non-selective plans (no need to store MatchAll)
                         var cp = child_plan;
@@ -116,7 +125,11 @@ fn decomposeNode(node: *const regex.AstNode, allocator: std.mem.Allocator) !Quer
             // Flush remaining literals
             if (literal_buf.items.len >= trigram.TRIGRAM_SIZE) {
                 const plan = try literalsToTrigrams(literal_buf.items, allocator);
-                try fragments.append(allocator, plan);
+                fragments.append(allocator, plan) catch |e| {
+                    var p = plan;
+                    p.deinit(allocator);
+                    return e;
+                };
             }
 
             return switch (fragments.items.len) {
@@ -131,6 +144,7 @@ fn decomposeNode(node: *const regex.AstNode, allocator: std.mem.Allocator) !Quer
             // If either branch is MatchAll, the whole OR is MatchAll.
             var branches: std.ArrayList(QueryPlan) = .{};
             defer if (branches.capacity > 0) branches.deinit(allocator);
+            errdefer for (branches.items) |*b| @constCast(b).deinit(allocator);
 
             // Flatten alternation tree (also left-associative)
             var flat_alts: std.ArrayList(*const regex.AstNode) = .{};
@@ -144,9 +158,14 @@ fn decomposeNode(node: *const regex.AstNode, allocator: std.mem.Allocator) !Quer
                     var p = plan;
                     p.deinit(allocator);
                     for (branches.items) |*b| b.deinit(allocator);
+                    branches.items.len = 0; // prevent errdefer double-free
                     return .{ .match_all = {} };
                 }
-                try branches.append(allocator, plan);
+                branches.append(allocator, plan) catch |e| {
+                    var p2 = plan;
+                    p2.deinit(allocator);
+                    return e;
+                };
             }
 
             return switch (branches.items.len) {
@@ -318,4 +337,29 @@ test "decompose quantifier with min >= 1" {
     var plan = try testDecompose("error+");
     defer plan.deinit(std.testing.allocator);
     try std.testing.expect(plan.isSelective());
+}
+
+test "decompose does not leak on allocation failure" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Parse a pattern that produces concat with multiple literal fragments
+    var parser = regex.Parser.init(arena, "function.*return");
+    const ast = try parser.parse();
+
+    // Use a failing allocator that fails after a few allocations
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = i });
+        const result = decompose(ast, failing.allocator());
+        if (result) |*plan_ptr| {
+            var plan = plan_ptr.*;
+            plan.deinit(allocator);
+            break; // succeeded — all allocation points passed
+        } else |_| {
+            // Expected: allocation failure — testing.allocator detects leaks
+        }
+    }
 }

@@ -215,7 +215,7 @@ fn executePlan(
                 const sub_ids = try executePlan(index, sub, allocator);
                 if (sub_ids == null) continue; // MatchAll sub-plan, skip
 
-                defer allocator.free(sub_ids.?);
+                defer if (sub_ids.?.len > 0) allocator.free(sub_ids.?);
 
                 if (result_set == null) {
                     // First selective sub-plan — seed the result
@@ -250,8 +250,7 @@ fn executePlan(
                     var rs = result_set.?;
                     rs.deinit();
                     result_set = null;
-                    const empty = try allocator.alloc(u32, 0);
-                    return empty;
+                    return &.{};
                 }
             }
 
@@ -281,11 +280,15 @@ fn executePlan(
                     // One branch is MatchAll → entire OR is MatchAll
                     return null;
                 }
-                defer allocator.free(sub_ids.?);
+                defer if (sub_ids.?.len > 0) allocator.free(sub_ids.?);
 
                 for (sub_ids.?) |id| {
                     try result_set.put(id, {});
                 }
+            }
+
+            if (result_set.count() == 0) {
+                return &.{};
             }
 
             var result = try allocator.alloc(u32, result_set.count());
@@ -309,12 +312,12 @@ fn intersectTrigramPostings(
     allocator: std.mem.Allocator,
 ) ![]u32 {
     if (hashes.len == 0) {
-        return try allocator.alloc(u32, 0);
+        return &.{};
     }
 
     // Get first posting list
     const first_postings = index.postings.get(hashes[0]) orelse {
-        return try allocator.alloc(u32, 0);
+        return &.{};
     };
 
     var candidates = std.AutoHashMap(u32, void).init(allocator);
@@ -327,7 +330,7 @@ fn intersectTrigramPostings(
     // Intersect with remaining posting lists
     for (hashes[1..]) |hash| {
         const postings = index.postings.get(hash) orelse {
-            return try allocator.alloc(u32, 0);
+            return &.{};
         };
 
         var posting_set = std.AutoHashMap(u32, void).init(allocator);
@@ -351,7 +354,7 @@ fn intersectTrigramPostings(
         }
 
         if (candidates.count() == 0) {
-            return try allocator.alloc(u32, 0);
+            return &.{};
         }
     }
 
@@ -437,4 +440,69 @@ test "queryCandidates filters non-matching files" {
 
     try std.testing.expectEqual(@as(usize, 1), result.file_ids.len);
     try std.testing.expectEqual(@as(u32, 0), result.file_ids[0]);
+}
+
+test "queryCandidatesFromPlan returns allFiles for non-selective plan" {
+    var postings = std.AutoHashMap(u32, []builder.PostingEntry).init(std.testing.allocator);
+    defer postings.deinit();
+
+    var paths = try std.testing.allocator.alloc([]const u8, 3);
+    defer std.testing.allocator.free(paths);
+    paths[0] = "a.txt";
+    paths[1] = "b.txt";
+    paths[2] = "c.txt";
+
+    const index = builder.TrigramIndex{
+        .file_paths = paths,
+        .postings = postings,
+        .file_count = 3,
+        .allocator = std.testing.allocator,
+    };
+
+    // A non-selective plan (MatchAll) should return ALL files
+    var plan = query_decompose.QueryPlan{ .match_all = {} };
+    var result = try queryCandidatesFromPlan(&index, &plan, std.testing.allocator);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), result.file_ids.len);
+}
+
+test "queryCandidatesFromPlan with selective plan yielding zero results does not leak" {
+    var postings = std.AutoHashMap(u32, []builder.PostingEntry).init(std.testing.allocator);
+    defer postings.deinit();
+
+    var paths = try std.testing.allocator.alloc([]const u8, 1);
+    defer std.testing.allocator.free(paths);
+    paths[0] = "a.txt";
+
+    const index = builder.TrigramIndex{
+        .file_paths = paths,
+        .postings = postings,
+        .file_count = 1,
+        .allocator = std.testing.allocator,
+    };
+
+    // Trigrams that don't exist in the index → empty result, must not leak
+    var hashes = [_]u32{0x123456};
+    var plan = query_decompose.QueryPlan{ .trigrams = &hashes };
+    var result = try queryCandidatesFromPlan(&index, &plan, std.testing.allocator);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.file_ids.len);
+}
+
+test "intersectTrigramPostings empty hashes does not leak" {
+    var postings = std.AutoHashMap(u32, []builder.PostingEntry).init(std.testing.allocator);
+    defer postings.deinit();
+
+    const index = builder.TrigramIndex{
+        .file_paths = &.{},
+        .postings = postings,
+        .file_count = 0,
+        .allocator = std.testing.allocator,
+    };
+
+    const result = try intersectTrigramPostings(&index, &.{}, std.testing.allocator);
+    // Result is comptime empty slice, no free needed
+    try std.testing.expectEqual(@as(usize, 0), result.len);
 }

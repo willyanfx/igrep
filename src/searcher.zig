@@ -119,11 +119,9 @@ pub const Searcher = struct {
             };
             defer plan.deinit(self.allocator);
 
-            if (plan.isSelective()) {
-                return index_query.queryCandidatesFromPlan(idx, &plan, self.allocator);
-            }
+            return index_query.queryCandidatesFromPlan(idx, &plan, self.allocator);
         }
-        // Literal mode or non-selective regex — use raw pattern trigrams
+        // Literal mode or fixed-string — use raw pattern trigrams
         return index_query.queryCandidates(idx, self.config.pattern, self.allocator);
     }
 
