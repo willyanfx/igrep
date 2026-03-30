@@ -87,4 +87,7 @@ test {
     _ = @import("index/cache.zig");
     _ = @import("util/pool.zig");
     _ = @import("util/simd.zig");
+    _ = @import("engine/aho_corasick.zig");
+    _ = @import("engine/prefilter.zig");
+    _ = @import("io/reader.zig");
 }

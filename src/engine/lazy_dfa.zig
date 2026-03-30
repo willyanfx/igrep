@@ -12,22 +12,23 @@ const CharRange = regex_mod.CharRange;
 /// set of NFA states + same input byte) we jump straight to the next
 /// DFA state without touching the NFA at all.
 ///
-/// Uses a flat transition table: each DFA state has a 256-entry array
-/// indexed by input byte, giving O(1) lookup on the hot path.
+/// Uses byte equivalence classes to compress transition tables: bytes that
+/// behave identically in the regex share a class, so each state only needs
+/// `num_classes` entries instead of 256. This typically reduces state size
+/// from 1KB to ~40 bytes, dramatically improving cache locality.
 ///
 /// The cache is bounded: once it exceeds `MAX_DFA_STATES` we flush and
 /// restart, which degrades gracefully to plain NFA speed on pathological
 /// patterns that generate too many unique state-sets.
 pub const LazyDfa = struct {
     /// Maximum cached DFA states before we flush.
-    /// Each state costs 1KB (256 × u32 transition table), so 4096 states = 4MB.
     const MAX_DFA_STATES: usize = 4096;
 
     /// A DFA state is identified by its index in `states`.
     const StateId = u32;
     const UNKNOWN: StateId = std.math.maxInt(StateId);
 
-    /// A DFA state: the NFA bitset it represents + flat transition table.
+    /// A DFA state: the NFA bitset it represents + compressed transition table.
     const DfaState = struct {
         /// Owned copy of the NFA bitset for this DFA state.
         bitset: []u64,
@@ -35,9 +36,9 @@ pub const LazyDfa = struct {
         is_match: bool,
         /// Hash of the bitset (for intern lookup).
         hash: u64,
-        /// Flat transition table: trans[byte] = next DFA state, or UNKNOWN.
-        /// Lazily filled on first encounter of each byte value.
-        trans: *[256]StateId,
+        /// Compressed transition table: trans[byte_class] = next DFA state, or UNKNOWN.
+        /// Indexed by equivalence class (not raw byte), lazily filled.
+        trans: []StateId,
     };
 
     allocator: std.mem.Allocator,
@@ -95,7 +96,7 @@ pub const LazyDfa = struct {
     pub fn deinit(self: *LazyDfa) void {
         for (self.states.items) |state| {
             self.allocator.free(state.bitset);
-            self.allocator.destroy(state.trans);
+            self.allocator.free(state.trans);
         }
         if (self.states.capacity > 0) self.states.deinit(self.allocator);
         self.hash_to_state.deinit();
@@ -106,7 +107,7 @@ pub const LazyDfa = struct {
     fn flush(self: *LazyDfa) void {
         for (self.states.items) |state| {
             self.allocator.free(state.bitset);
-            self.allocator.destroy(state.trans);
+            self.allocator.free(state.trans);
         }
         self.states.items.len = 0;
         self.hash_to_state.clearRetainingCapacity();
@@ -144,8 +145,8 @@ pub const LazyDfa = struct {
 
         const is_match = self.bitsetContainsAccept(owned);
 
-        // Allocate flat transition table, initialized to UNKNOWN
-        const trans = try self.allocator.create([256]StateId);
+        // Allocate compressed transition table (num_classes entries), initialized to UNKNOWN
+        const trans = try self.allocator.alloc(StateId, self.num_classes);
         @memset(trans, UNKNOWN);
 
         const id: StateId = @intCast(self.states.items.len);
@@ -173,17 +174,18 @@ pub const LazyDfa = struct {
     }
 
     /// Compute the next DFA state from `current` on input `byte`.
-    /// Hot path: single array lookup. Cold path: NFA simulation + cache fill.
+    /// Hot path: byte class lookup + single array lookup. Cold path: NFA simulation + cache fill.
     inline fn step(self: *LazyDfa, current: StateId, byte: u8, text: []const u8, next_pos: usize) !StateId {
+        const class = self.byte_classes[byte];
         const trans = self.states.items[current].trans;
-        const cached = trans[byte];
+        const cached = trans[class];
         if (cached != UNKNOWN) return cached;
 
-        return self.stepSlow(current, byte, text, next_pos);
+        return self.stepSlow(current, byte, class, text, next_pos);
     }
 
     /// Cold path: simulate one NFA step, intern result, fill transition table.
-    fn stepSlow(self: *LazyDfa, current: StateId, byte: u8, text: []const u8, next_pos: usize) !StateId {
+    fn stepSlow(self: *LazyDfa, current: StateId, byte: u8, class: u8, text: []const u8, next_pos: usize) !StateId {
         const current_bitset = self.states.items[current].bitset;
         @memset(self.scratch_buf[0..self.set_size], 0);
 
@@ -222,7 +224,7 @@ pub const LazyDfa = struct {
         // Fill the transition table (the current state may have moved due to flush,
         // so re-index). After a flush the current state is gone, so skip caching.
         if (current < self.states.items.len) {
-            self.states.items[current].trans[byte] = next_id;
+            self.states.items[current].trans[class] = next_id;
         }
 
         return next_id;

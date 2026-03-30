@@ -1147,6 +1147,94 @@ fn isFullyLiteral(node: *const AstNode) bool {
     };
 }
 
+/// Extract literal alternatives from a top-level alternation pattern.
+/// For patterns like "error|warn|fatal", returns ["error", "warn", "fatal"].
+/// Returns null if the pattern is not a pure alternation of literals.
+fn extractAlternationLiterals(ast: *const AstNode, allocator: std.mem.Allocator) ?[][]const u8 {
+    // Must be an alternation at root
+    if (ast.kind != .alternate) return null;
+
+    // Count alternatives first
+    var count: usize = 0;
+    countAlternatives(ast, &count);
+    if (count < 2) return null;
+
+    // Collect all literal branches
+    var literals = allocator.alloc([]const u8, count) catch return null;
+    var idx: usize = 0;
+    if (!collectAlternativeLiterals(ast, allocator, literals, &idx)) {
+        // Not all branches are pure literals — free and return null
+        for (literals[0..idx]) |lit| allocator.free(lit);
+        allocator.free(literals);
+        return null;
+    }
+
+    return literals;
+}
+
+fn countAlternatives(node: *const AstNode, count: *usize) void {
+    if (node.kind == .alternate) {
+        if (node.left) |left| countAlternatives(left, count);
+        if (node.right) |right| countAlternatives(right, count);
+    } else {
+        count.* += 1;
+    }
+}
+
+/// Collect literal strings from each branch of an alternation tree.
+/// Returns false if any branch is not a pure literal.
+fn collectAlternativeLiterals(
+    node: *const AstNode,
+    allocator: std.mem.Allocator,
+    out: [][]const u8,
+    idx: *usize,
+) bool {
+    if (node.kind == .alternate) {
+        if (node.left) |left| {
+            if (!collectAlternativeLiterals(left, allocator, out, idx)) return false;
+        }
+        if (node.right) |right| {
+            if (!collectAlternativeLiterals(right, allocator, out, idx)) return false;
+        }
+        return true;
+    }
+
+    // This branch must be a pure literal (single char or concat of literals)
+    if (!isFullyLiteral(node)) return false;
+
+    // Extract the literal string
+    var buf: std.ArrayList(u8) = .{};
+    collectAllChars(node, &buf, allocator);
+    if (buf.items.len == 0) {
+        if (buf.capacity > 0) buf.deinit(allocator);
+        return false;
+    }
+
+    const owned = buf.toOwnedSlice(allocator) catch {
+        if (buf.capacity > 0) buf.deinit(allocator);
+        return false;
+    };
+
+    if (idx.* < out.len) {
+        out[idx.*] = owned;
+        idx.* += 1;
+        return true;
+    }
+    allocator.free(owned);
+    return false;
+}
+
+fn collectAllChars(node: *const AstNode, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) void {
+    switch (node.kind) {
+        .literal => buf.append(allocator, node.char) catch {},
+        .concat => {
+            if (node.left) |left| collectAllChars(left, buf, allocator);
+            if (node.right) |right| collectAllChars(right, buf, allocator);
+        },
+        else => {},
+    }
+}
+
 // Inner literal extraction (TODO: implement safely for patterns like \d+\.\d+)
 
 fn extractInnerLiteral(ast: *const AstNode, allocator: std.mem.Allocator) ?[]const u8 {
@@ -1315,6 +1403,9 @@ pub const Regex = struct {
     is_literal: bool,
     literal_str: []const u8,
     required_literal: ?[]const u8,
+    /// Literal alternatives extracted from top-level alternations (e.g. "error|warn|fatal").
+    /// Non-null when the pattern is a pure alternation of literals.
+    alternation_literals: ?[][]const u8 = null,
     allocator: std.mem.Allocator,
     byte_classes: [256]u8 = undefined, // Maps byte -> equivalence class ID
     num_classes: u16 = 256, // Number of distinct byte equivalence classes
@@ -1338,6 +1429,9 @@ pub const Regex = struct {
         const req_lit = extractRequiredLiterals(ast, allocator) orelse
             extractInnerLiteral(ast, allocator);
 
+        // Extract alternation literals (e.g. "error|warn|fatal" -> ["error", "warn", "fatal"])
+        const alt_lits = extractAlternationLiterals(ast, allocator);
+
         // NFA compiler uses the real allocator since NFA states must outlive compile()
         var compiler = NfaCompiler.init(allocator);
         var nfa = try compiler.compile(ast);
@@ -1359,6 +1453,7 @@ pub const Regex = struct {
             .is_literal = lit != null,
             .literal_str = lit orelse "",
             .required_literal = req_lit,
+            .alternation_literals = alt_lits,
             .allocator = allocator,
             .byte_classes = byte_classes,
             .num_classes = num_classes,
@@ -1369,6 +1464,10 @@ pub const Regex = struct {
         self.nfa.deinit(allocator);
         if (self.required_literal) |lit| {
             allocator.free(lit);
+        }
+        if (self.alternation_literals) |lits| {
+            for (lits) |lit| allocator.free(lit);
+            allocator.free(lits);
         }
     }
 

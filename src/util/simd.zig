@@ -93,81 +93,48 @@ pub fn simdInfo() SimdInfo {
     };
 }
 
+const libc = @cImport({
+    @cInclude("string.h");
+});
+
 /// Find the next occurrence of `byte` in `data` starting from `start`.
-/// Uses adaptive SIMD width: 32 bytes (AVX2) on capable CPUs, else 16 bytes (SSE/NEON).
-/// Falls back to scalar for the tail.
+/// Uses libc memchr for maximum throughput — it contains platform-specific
+/// assembly tuned for each CPU (e.g., Apple Silicon NEON, x86 AVX2).
 pub fn findNextByte(data: []const u8, byte: u8, start: usize) ?usize {
     if (start >= data.len) return null;
-
-    var pos = start;
-
-    // Use wide vector if available for the main loop
-    if (VECTOR_LEN == 16 and WIDE_VECTOR_LEN == 32 and data.len - start >= 32) {
-        return findNextByteWide(data, byte, start);
-    }
-
-    // Standard path with current VECTOR_LEN
-    const needle_vec: @Vector(VECTOR_LEN, u8) = @splat(byte);
-
-    while (pos + VECTOR_LEN <= data.len) {
-        const chunk: @Vector(VECTOR_LEN, u8) = data[pos..][0..VECTOR_LEN].*;
-        const matches = chunk == needle_vec;
-        const mask = movemask(matches);
-        if (mask != 0) {
-            return pos + @as(usize, @ctz(mask));
-        }
-        pos += VECTOR_LEN;
-    }
-
-    // Scalar tail
-    while (pos < data.len) {
-        if (data[pos] == byte) return pos;
-        pos += 1;
+    const slice = data[start..];
+    const result: ?[*]const u8 = @ptrCast(libc.memchr(slice.ptr, byte, slice.len));
+    if (result) |ptr| {
+        return start + (@intFromPtr(ptr) - @intFromPtr(slice.ptr));
     }
     return null;
 }
 
-/// Wide vector path for AVX2-capable systems (32-byte scans).
-/// Only used when VECTOR_LEN is 16 but we want wider scans for long data.
-fn findNextByteWide(data: []const u8, byte: u8, start: usize) ?usize {
-    var pos = start;
-    const needle_vec_wide: @Vector(WIDE_VECTOR_LEN, u8) = @splat(byte);
+/// Lowercase an ASCII buffer using SIMD: 'A'-'Z' → 'a'-'z', all else unchanged.
+/// Processes VECTOR_LEN bytes per iteration with scalar tail.
+pub fn toLowerBuf(src: []const u8, dst: []u8) void {
+    std.debug.assert(dst.len >= src.len);
 
-    // 32-byte scans when available
-    while (pos + WIDE_VECTOR_LEN <= data.len) {
-        const chunk: @Vector(WIDE_VECTOR_LEN, u8) = data[pos..][0..WIDE_VECTOR_LEN].*;
-        const matches = chunk == needle_vec_wide;
-        const mask = movemask_wide(matches);
-        if (mask != 0) {
-            return pos + @as(usize, @ctz(mask));
-        }
-        pos += WIDE_VECTOR_LEN;
-    }
+    const a_vec: @Vector(VECTOR_LEN, u8) = @splat('A');
+    const z_vec: @Vector(VECTOR_LEN, u8) = @splat('Z');
+    const offset_vec: @Vector(VECTOR_LEN, u8) = @splat(32);
 
-    // Fall back to narrow vector for remaining bytes
-    const needle_vec: @Vector(VECTOR_LEN, u8) = @splat(byte);
-    while (pos + VECTOR_LEN <= data.len) {
-        const chunk: @Vector(VECTOR_LEN, u8) = data[pos..][0..VECTOR_LEN].*;
-        const matches = chunk == needle_vec;
-        const mask = movemask(matches);
-        if (mask != 0) {
-            return pos + @as(usize, @ctz(mask));
-        }
+    var pos: usize = 0;
+    while (pos + VECTOR_LEN <= src.len) {
+        const chunk: @Vector(VECTOR_LEN, u8) = src[pos..][0..VECTOR_LEN].*;
+        const ge_a: @Vector(VECTOR_LEN, u1) = @bitCast(chunk >= a_vec);
+        const le_z: @Vector(VECTOR_LEN, u1) = @bitCast(chunk <= z_vec);
+        const upper_mask: @Vector(VECTOR_LEN, bool) = @bitCast(ge_a & le_z);
+        dst[pos..][0..VECTOR_LEN].* = @select(u8, upper_mask, chunk +% offset_vec, chunk);
         pos += VECTOR_LEN;
     }
 
     // Scalar tail
-    while (pos < data.len) {
-        if (data[pos] == byte) return pos;
+    while (pos < src.len) {
+        const c = src[pos];
+        dst[pos] = if (c >= 'A' and c <= 'Z') c + 32 else c;
         pos += 1;
     }
-    return null;
-}
-
-/// Convert a wide (32-byte) boolean vector to a bitmask.
-/// Similar to movemask but for 32-byte vectors.
-fn movemask_wide(bools: @Vector(WIDE_VECTOR_LEN, bool)) u32 {
-    return @bitCast(bools);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────

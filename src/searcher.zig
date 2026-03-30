@@ -3,8 +3,11 @@ const cli = @import("cli.zig");
 const literal = @import("engine/literal.zig");
 const regex_engine = @import("engine/regex.zig");
 const lazy_dfa_mod = @import("engine/lazy_dfa.zig");
+const prefilter_mod = @import("engine/prefilter.zig");
+const aho_corasick = @import("engine/aho_corasick.zig");
 const simd_utils = @import("util/simd.zig");
 const mmap = @import("io/mmap.zig");
+const reader = @import("io/reader.zig");
 const walker = @import("io/walker.zig");
 const output_printer = @import("output/printer.zig");
 const output_buffer = @import("output/buffer.zig");
@@ -35,6 +38,10 @@ pub const Searcher = struct {
     /// Owned lowercased pattern for case-insensitive regex compilation.
     /// The compiled regex references this slice, so it must outlive the regex.
     ci_pattern_buf: ?[]u8 = null,
+
+    /// Aho-Corasick automaton for alternation-literal patterns (e.g. "error|warn|fatal").
+    /// Built once during init, used for O(n) multi-pattern matching in searchFile.
+    ac_automaton: ?aho_corasick.AhoCorasick = null,
 
     total_matches: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
@@ -83,6 +90,14 @@ pub const Searcher = struct {
             }
         }
 
+        // Build Aho-Corasick automaton for alternation-literal patterns
+        var ac: ?aho_corasick.AhoCorasick = null;
+        if (compiled != null) {
+            if (compiled.?.alternation_literals) |lits| {
+                ac = aho_corasick.AhoCorasick.build(allocator, lits) catch null;
+            }
+        }
+
         return Searcher{
             .allocator = allocator,
             .config = config,
@@ -91,10 +106,14 @@ pub const Searcher = struct {
             .compiled_regex = compiled,
             .use_literal_path = use_literal,
             .ci_pattern_buf = ci_pat,
+            .ac_automaton = ac,
         };
     }
 
     pub fn deinit(self: *Searcher) void {
+        if (self.ac_automaton) |*ac| {
+            ac.deinit();
+        }
         if (self.compiled_regex != null) {
             self.compiled_regex.?.deinit(self.allocator);
         }
@@ -198,17 +217,11 @@ pub const Searcher = struct {
             try self.runParallel(file_list.items);
         } else {
             // Single-threaded: write directly to stdout, no buffers needed
-            // Prefetch lookahead for next files
             var direct_printer = output_printer.Printer.init(
                 self.stdout_writer,
                 self.use_color,
                 self.config.line_number,
             );
-            var lookahead: [2]?mmap.MappedFile = .{ null, null };
-            defer {
-                if (lookahead[0]) |*f| f.close();
-                if (lookahead[1]) |*f| f.close();
-            }
 
             // Create one DFA for all files in single-threaded mode
             var shared_dfa: ?lazy_dfa_mod.LazyDfa = null;
@@ -221,23 +234,14 @@ pub const Searcher = struct {
             }
             defer if (shared_dfa) |*dfa| dfa.deinit();
 
-            for (file_list.items, 0..) |file_path, idx| {
-                // Refill lookahead: open next files
-                if (lookahead[0]) |*f| f.close();
-                lookahead[0] = lookahead[1];
-                lookahead[1] = null;
+            // Reusable read buffer for small files (avoids per-file allocation)
+            var read_buf: [256 * 1024]u8 = undefined;
 
-                if (idx + 1 < file_list.items.len) {
-                    lookahead[0] = mmap.MappedFile.prefetchPath(file_list.items[idx + 1]) catch null;
-                }
-                if (idx + 2 < file_list.items.len) {
-                    lookahead[1] = mmap.MappedFile.prefetchPath(file_list.items[idx + 2]) catch null;
-                }
-
+            for (file_list.items) |file_path| {
                 if (shared_dfa) |*dfa| {
-                    self.searchFile(file_path, &direct_printer, dfa);
+                    self.searchFile(file_path, &direct_printer, dfa, &read_buf);
                 } else {
-                    self.searchFile(file_path, &direct_printer, null);
+                    self.searchFile(file_path, &direct_printer, null, &read_buf);
                 }
             }
             direct_printer.flush();
@@ -315,11 +319,14 @@ pub const Searcher = struct {
             }
             defer if (shared_dfa) |*dfa| dfa.deinit();
 
+            // Reusable read buffer for small files
+            var read_buf: [256 * 1024]u8 = undefined;
+
             for (candidates.items) |file_path| {
                 if (shared_dfa) |*dfa| {
-                    self.searchFile(file_path, &direct_printer, dfa);
+                    self.searchFile(file_path, &direct_printer, dfa, &read_buf);
                 } else {
-                    self.searchFile(file_path, &direct_printer, null);
+                    self.searchFile(file_path, &direct_printer, null, &read_buf);
                 }
             }
             direct_printer.flush();
@@ -356,11 +363,14 @@ pub const Searcher = struct {
         }
     }
 
-    /// Run search across files using a thread pool.
+    /// Run search across files using a thread pool with chunk-based spawning.
+    /// Each worker thread processes a chunk of files and reuses a single DFA
+    /// across all files in its chunk, eliminating per-file DFA alloc/dealloc.
     fn runParallel(self: *Searcher, files: []const []const u8) !void {
+        const cpu_count = std.Thread.getCpuCount() catch 4;
         const thread_count: u32 = self.config.threads orelse @intCast(@min(
             files.len,
-            std.Thread.getCpuCount() catch 4,
+            cpu_count,
         ));
 
         var pool: std.Thread.Pool = undefined;
@@ -372,9 +382,21 @@ pub const Searcher = struct {
 
         var wg = std.Thread.WaitGroup{};
 
-        for (files) |file_path| {
+        // Divide files into chunks — one chunk per worker thread.
+        // Each chunk task creates one DFA and reuses it across all its files.
+        const chunk_size = files.len / thread_count;
+        const remainder = files.len % thread_count;
+
+        var offset: usize = 0;
+        for (0..thread_count) |i| {
+            // Distribute remainder across first `remainder` chunks
+            const this_chunk = chunk_size + @as(usize, if (i < remainder) 1 else 0);
+            if (this_chunk == 0) break;
+            const chunk = files[offset..][0..this_chunk];
+            offset += this_chunk;
+
             wg.start();
-            pool.spawn(workerSearchFile, .{ self, file_path, &wg }) catch {
+            pool.spawn(workerSearchChunk, .{ self, chunk, &wg }) catch {
                 wg.finish();
                 continue;
             };
@@ -383,15 +405,24 @@ pub const Searcher = struct {
         wg.wait();
     }
 
-    /// Worker function executed on thread pool threads.
-    /// Each worker gets its own OutputBuffer — no lock during search/format.
-    /// Note: Due to thread pool architecture (per-file spawning), each file still
-    /// gets its own DFA. For true per-worker DFA reuse, the thread pool would need
-    /// restructuring. The LUT optimization (#1) provides the main perf gains here.
-    fn workerSearchFile(self: *Searcher, file_path: []const u8, wg: *std.Thread.WaitGroup) void {
+    /// Worker function that processes a chunk of files on a single thread.
+    /// Creates one DFA and reuses it across all files in the chunk,
+    /// and uses one output buffer for the entire chunk.
+    fn workerSearchChunk(self: *Searcher, chunk: []const []const u8, wg: *std.Thread.WaitGroup) void {
         defer wg.finish();
 
-        // Thread-local output buffer with 4KB initial capacity — avoids early reallocs
+        // One DFA for the entire chunk — reused across all files
+        var shared_dfa: ?lazy_dfa_mod.LazyDfa = null;
+        if (!self.use_literal_path) {
+            if (self.compiled_regex) |*re| {
+                if (re.createDfa(self.allocator)) |dfa| {
+                    shared_dfa = dfa;
+                } else |_| {}
+            }
+        }
+        defer if (shared_dfa) |*dfa| dfa.deinit();
+
+        // Thread-local output buffer with 4KB initial capacity
         var out_buf = output_buffer.OutputBuffer.initWithCapacity(self.allocator, 4096) catch output_buffer.OutputBuffer.init();
         defer out_buf.deinit(self.allocator);
 
@@ -402,14 +433,23 @@ pub const Searcher = struct {
             self.config.line_number,
         );
 
-        // Pass null for optional_dfa; each worker gets per-file DFAs
-        self.searchFile(file_path, &printer, null);
+        // Per-worker reusable read buffer for small files (avoids per-file allocation)
+        var read_buf: [256 * 1024]u8 = undefined;
 
-        // Only take the lock to flush the completed buffer to stdout
-        if (!out_buf.isEmpty()) {
-            self.output_mutex.lock();
-            defer self.output_mutex.unlock();
-            self.stdout_writer.writeAll(out_buf.slice()) catch {};
+        for (chunk) |file_path| {
+            if (shared_dfa) |*dfa| {
+                self.searchFile(file_path, &printer, dfa, &read_buf);
+            } else {
+                self.searchFile(file_path, &printer, null, &read_buf);
+            }
+
+            // Flush per-file to keep memory bounded and preserve per-file output grouping
+            if (!out_buf.isEmpty()) {
+                self.output_mutex.lock();
+                defer self.output_mutex.unlock();
+                self.stdout_writer.writeAll(out_buf.slice()) catch {};
+            }
+            out_buf.reset();
         }
     }
 
@@ -418,8 +458,9 @@ pub const Searcher = struct {
     /// it was initialized with (buffer for parallel, stdout for single-threaded).
     /// If dfa is provided, it will be reused across files (caller manages lifetime).
     /// If dfa is null, a per-file DFA is created and destroyed.
-    fn searchFile(self: *Searcher, file_path: []const u8, printer: *output_printer.Printer, optional_dfa: ?*lazy_dfa_mod.LazyDfa) void {
-        var mapped = mmap.MappedFile.open(file_path) catch |err| {
+    /// If read_buf is provided, small files reuse it to avoid allocation.
+    fn searchFile(self: *Searcher, file_path: []const u8, printer: *output_printer.Printer, optional_dfa: ?*lazy_dfa_mod.LazyDfa, read_buf: ?[]u8) void {
+        var fc = reader.FileContents.open(file_path, self.allocator, read_buf) catch |err| {
             switch (err) {
                 error.IsDir => return,
                 else => {
@@ -429,9 +470,9 @@ pub const Searcher = struct {
                 },
             }
         };
-        defer mapped.close();
+        defer fc.close(self.allocator);
 
-        const contents = mapped.data();
+        const contents = fc.data();
         if (contents.len == 0) return;
 
         // Quick binary file detection: check first 512 bytes for null bytes
@@ -447,9 +488,7 @@ pub const Searcher = struct {
         const match_contents: []const u8 = if (ci_regex) blk: {
             lower_contents = self.allocator.alloc(u8, contents.len) catch null;
             if (lower_contents) |lc| {
-                for (contents, 0..) |c, i| {
-                    lc[i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
-                }
+                simd_utils.toLowerBuf(contents, lc);
                 break :blk lc;
             }
             break :blk contents; // allocation failed, fall back to original
@@ -497,48 +536,58 @@ pub const Searcher = struct {
         var file_matches: u64 = 0;
         var last_printed_line: u64 = 0;
 
-        // Cache the required literal for fast whole-file prefiltering
+        // Cache alternation literals for the fast multi-literal path.
+        const alt_literals = if (!self.use_literal_path and !self.config.invert_match and self.compiled_regex != null)
+            self.compiled_regex.?.alternation_literals
+        else
+            null;
+
+        // Cache the required literal for the single-literal prefilter path.
         const req_literal = if (!self.use_literal_path and !self.config.invert_match and
-            self.compiled_regex != null)
+            self.compiled_regex != null and alt_literals == null)
             self.compiled_regex.?.required_literal
         else
             null;
 
-        // Optimization: whole-file literal prefilter for regex patterns.
-        // Instead of checking every line, scan the whole file buffer for the
-        // required literal, then only extract + DFA-check lines containing it.
-        // This converts O(lines) regex checks to O(literal_occurrences) checks,
-        // providing 5-10× speedup when the literal is sparse.
-        if (req_literal) |req_lit| {
-            const re = &self.compiled_regex.?;
+        // Fast path for pure alternation-of-literals patterns (e.g. "error|warn|fatal").
+        // Uses whole-file SIMD literal scan: find earliest occurrence of any literal,
+        // extract line, report match without DFA confirmation.
+        if (alt_literals) |lits| {
             var scan_pos: usize = 0;
             var last_checked_line_start: usize = std.math.maxInt(usize);
-            // Track line numbers incrementally
             var running_line_count_pos: usize = 0;
             var running_line_num: u64 = 1;
 
-            // Scan match_contents (lowered for CI regex) so the required
-            // literal (also lowered when CI) is found correctly.
-            while (literal.findFirst(match_contents[scan_pos..], req_lit)) |rel_pos| {
-                const lit_pos = scan_pos + rel_pos;
+            while (scan_pos < match_contents.len) {
+                // Find earliest occurrence of any alternation literal via SIMD
+                var best_pos: ?usize = null;
+                for (lits) |lit| {
+                    if (literal.findFirst(match_contents[scan_pos..], lit)) |rel| {
+                        const abs = scan_pos + rel;
+                        if (best_pos == null or abs < best_pos.?) {
+                            best_pos = abs;
+                            // Can't do better than current position
+                            if (abs == scan_pos) break;
+                        }
+                    }
+                }
+                if (best_pos == null) break;
+                const pos = best_pos.?;
 
                 // Find the line containing this occurrence
-                // Scan backward for '\n' (typically only ~30 bytes back)
-                var ls: usize = lit_pos;
+                var ls: usize = pos;
                 while (ls > 0 and contents[ls - 1] != '\n') : (ls -= 1) {}
                 const cand_line_start = ls;
 
                 // Deduplicate: skip if we already checked this line
                 if (cand_line_start == last_checked_line_start) {
-                    scan_pos = lit_pos + 1;
+                    scan_pos = pos + 1;
                     continue;
                 }
                 last_checked_line_start = cand_line_start;
 
-                // Find line end
-                const cand_line_end = simd_utils.findNextByte(contents, '\n', lit_pos) orelse contents.len;
+                const cand_line_end = simd_utils.findNextByte(contents, '\n', pos) orelse contents.len;
                 const cand_line = contents[cand_line_start..cand_line_end];
-                const cand_match_line = match_contents[cand_line_start..cand_line_end];
 
                 // Count line number incrementally
                 if (!self.config.count_only or self.config.line_number) {
@@ -549,7 +598,61 @@ pub const Searcher = struct {
                     running_line_count_pos = cand_line_start;
                 }
 
-                // Run DFA on the (possibly lowered) candidate line
+                file_matches += 1;
+                _ = self.total_matches.fetchAdd(1, .monotonic);
+
+                if (!self.config.count_only and !self.config.files_only) {
+                    printer.printMatch(
+                        file_path,
+                        running_line_num,
+                        cand_line,
+                        pattern,
+                        self.config.case_sensitive,
+                    ) catch {};
+                }
+
+                if (self.config.files_only) break;
+                if (self.config.max_count) |max| {
+                    if (file_matches >= max) break;
+                }
+
+                scan_pos = cand_line_end + 1;
+            }
+        } else if (req_literal) |req_lit| {
+            // Whole-file prefilter for regex patterns with a required literal.
+            // Instead of checking every line, scan the whole file buffer for the
+            // required literal, then only extract + DFA-check lines containing it.
+            const re = &self.compiled_regex.?;
+            var scan_pos: usize = 0;
+            var last_checked_line_start: usize = std.math.maxInt(usize);
+            var running_line_count_pos: usize = 0;
+            var running_line_num: u64 = 1;
+
+            while (literal.findFirst(match_contents[scan_pos..], req_lit)) |rel_pos| {
+                const lit_pos = scan_pos + rel_pos;
+
+                var ls: usize = lit_pos;
+                while (ls > 0 and contents[ls - 1] != '\n') : (ls -= 1) {}
+                const cand_line_start = ls;
+
+                if (cand_line_start == last_checked_line_start) {
+                    scan_pos = lit_pos + 1;
+                    continue;
+                }
+                last_checked_line_start = cand_line_start;
+
+                const cand_line_end = simd_utils.findNextByte(contents, '\n', lit_pos) orelse contents.len;
+                const cand_line = contents[cand_line_start..cand_line_end];
+                const cand_match_line = match_contents[cand_line_start..cand_line_end];
+
+                if (!self.config.count_only or self.config.line_number) {
+                    var cp: usize = running_line_count_pos;
+                    while (cp < cand_line_start) : (cp += 1) {
+                        if (contents[cp] == '\n') running_line_num += 1;
+                    }
+                    running_line_count_pos = cand_line_start;
+                }
+
                 const matched = if (file_dfa) |dfa|
                     (dfa.isMatch(cand_match_line) catch re.isMatch(cand_match_line) catch false)
                 else
@@ -574,12 +677,82 @@ pub const Searcher = struct {
                     }
                 }
 
-                // Skip past this line
                 scan_pos = cand_line_end + 1;
             }
+        } else if (self.use_literal_path and !self.config.invert_match and !has_context) {
+
+        // Whole-file literal prefilter: scan the full buffer for the pattern with SIMD,
+        // then derive line boundaries only for hits. For sparse patterns this skips
+        // non-matching regions entirely. For dense patterns the overhead is minimal
+        // since most lines hit anyway and we advance past each matched line.
+        var scan_pos: usize = 0;
+        var last_checked_line_start: usize = std.math.maxInt(usize);
+        var running_line_count_pos: usize = 0;
+        var running_line_num: u64 = 1;
+        const case_sensitive = self.config.case_sensitive;
+
+        while (true) {
+            const rel_pos = if (case_sensitive)
+                literal.findFirst(contents[scan_pos..], pattern)
+            else
+                literal.findFirstCaseInsensitive(contents[scan_pos..], pattern);
+
+            const pos = (rel_pos orelse break) + scan_pos;
+
+            // Find line boundaries
+            const cand_line_end = simd_utils.findNextByte(contents, '\n', pos) orelse contents.len;
+
+            // For dense matches, the pattern appears on consecutive lines, so
+            // scan_pos advances past each line end. For sparse matches, we jump
+            // directly to the next occurrence, skipping thousands of lines.
+            var ls: usize = pos;
+            while (ls > 0 and contents[ls - 1] != '\n') : (ls -= 1) {}
+            const cand_line_start = ls;
+
+            // Deduplicate: skip if we already checked this line
+            if (cand_line_start == last_checked_line_start) {
+                scan_pos = pos + 1;
+                continue;
+            }
+            last_checked_line_start = cand_line_start;
+
+            const cand_line = contents[cand_line_start..cand_line_end];
+
+            // Count line number incrementally
+            if (!self.config.count_only or self.config.line_number) {
+                var cp: usize = running_line_count_pos;
+                while (cp < cand_line_start) : (cp += 1) {
+                    if (contents[cp] == '\n') running_line_num += 1;
+                }
+                running_line_count_pos = cand_line_start;
+            }
+
+            file_matches += 1;
+            _ = self.total_matches.fetchAdd(1, .monotonic);
+
+            if (!self.config.count_only and !self.config.files_only) {
+                printer.printMatch(
+                    file_path,
+                    running_line_num,
+                    cand_line,
+                    pattern,
+                    case_sensitive,
+                ) catch {};
+            }
+
+            if (self.config.files_only) break;
+
+            if (self.config.max_count) |max| {
+                if (file_matches >= max) break;
+            }
+
+            scan_pos = cand_line_end + 1;
+        }
+
         } else {
 
         // SIMD-accelerated line iteration: scan 16 bytes at a time for '\n'
+        // Used for: regex without required-literal prefilter, invert match, context mode
         while (line_start < contents.len) {
             const nl_pos = simd_utils.findNextByte(contents, '\n', line_start);
             const line_end = nl_pos orelse contents.len;
@@ -674,7 +847,7 @@ pub const Searcher = struct {
                 line_num += 1;
             } // end while
 
-        } // end else (non-prefilter path)
+        } // end else (line-by-line fallback path)
 
         if (self.config.files_only and file_matches > 0) {
             printer.printFilePath(file_path) catch {};
